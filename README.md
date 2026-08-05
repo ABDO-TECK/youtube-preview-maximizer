@@ -19,7 +19,7 @@
 - يربط زر CC المخصص بمسارات `captionTracks` عند توفرها؛ وإذا لم يعرّض Preview مسارًا مباشرًا، تجلب الإضافة الترجمة النصية فقط وتضيفها كـWebVTT مؤقت داخل عنصر الفيديو نفسه.
 - لا تضيف الإضافة إعلانات ولا تنشئ أزرارًا لبطاقات الإعلانات أو المحتوى المروّج.
 - يحافظ الفيديو على نسبة العرض والارتفاع باستخدام `object-fit: contain`.
-- لا تستخدم iframe، ولا تحمّل الفيديو الكامل، ولا تطلب صلاحيات إضافية.
+- لا تطلب الإضافة صلاحيات إضافية. تستخدم فقط عنصر `video` الحالي الذي ينشئه YouTube للمعاينة، ولا تحمّل الفيديو الكامل أو تنشئ `iframe`.
 
 ## التثبيت محليًا
 
@@ -45,15 +45,15 @@
 6. جرّب الاختصارات: `Space`/`K`، `M`، `C`، `F`، و`←`/`→`.
 7. جرّب طرق الإغلاق الثلاث، ثم انتقل داخل YouTube أثناء فتح الـOverlay للتأكد من إغلاقه وتنظيفه.
 8. مرّر فوق بطاقة إعلان أو محتوى مروّج إن ظهر، وتأكد من عدم إضافة زر إليها.
-9. جرّب الضغط على الزر قبل بدء المعاينة؛ ستظهر الرسالة:
+9. جرّب الضغط على الزر في بطاقة لا توفر Preview؛ يجب أن تظهر الرسالة ولا يتم فتح مشغل آخر:
 
    `Move the mouse over the thumbnail until the preview starts, then try again.`
 
 ## ملاحظات ومشكلات معروفة
 
-- تعتمد الإضافة على عنصر `video` الذي ينشئه YouTube للمعاينة، وتبحث عنه داخل البطاقة أو داخل حاوية Preview العامة `ytd-video-preview`، ثم تنقله وحده إلى Overlay مخصص. إذا لم يبدأ YouTube المعاينة بعد، تنتظر الإضافة فترة قصيرة لإتاحة إنشاء العنصر قبل عرض الرسالة الإرشادية.
+- تعتمد الإضافة على عنصر `video` الذي ينشئه YouTube للمعاينة، وتبحث عنه داخل البطاقة أو داخل حاوية Preview العامة `ytd-video-preview`، ثم تنقله وحده إلى Overlay مخصص. إذا لم تبدأ المعاينة، يظهر تنبيه قصير ولا يتم تحميل الفيديو الكامل.
 - بعض معاينات YouTube لا تعرض `textTracks` في عالم الإضافة المعزول. لهذا تستخدم الإضافة `page-bridge.js` خارجيًا للوصول إلى Player API وبيانات captions فقط، من دون استخدام واجهة مشغل YouTube الأصلية أو `eval` أو JavaScript inline.
-- عند توفر `captionTracks`، تجلب الإضافة بيانات الترجمة النصية فقط، وتحوّلها إلى WebVTT مؤقت وتضيفها إلى عنصر المعاينة نفسه. تحاول اختيار لغة متصفح المستخدم، ثم تستخدم الترجمة الآلية المتاحة من YouTube عند الحاجة. لا يتم تحميل ملف الفيديو الكامل.
+- عند توفر `captionTracks`، تجلب الإضافة بيانات الترجمة النصية فقط، وتحوّلها إلى WebVTT مؤقت وتضيفها إلى عنصر المعاينة نفسه. تحاول اختيار لغة متصفح المستخدم، ثم تستخدم الترجمة الآلية المتاحة من YouTube عند الحاجة. لا يتم تحميل ملف الفيديو الكامل لمسار Preview.
 - مستويات الجودة والكابشنز خصائص يقررها YouTube لكل Preview؛ إذا لم يقدم YouTube مسارات captions أو رفض endpoint الترجمة، سيظهر إشعار واضح بدل ترك الزر يعمل بلا نتيجة.
 - قد يعيد YouTube بناء البطاقة أثناء فتح الـOverlay. عند حذف البطاقة الأصلية تغلق الإضافة الـOverlay وتزيل الفيديو المؤقت بأمان.
 - في صفحات المشاهدة، تربط الإضافة الـPreview بمعرّف بطاقة الفيديو الحالية قبل فتحها؛ وإذا لم يكن الربط موثوقًا لا تختار Preview عشوائيًا من فيديو مقترح آخر.
@@ -93,4 +93,14 @@ youtube-preview-maximizer/
 
 ## الصلاحيات وCSP
 
-لا يحتوي `manifest.json` على `permissions` أو `host_permissions`؛ يتم حقن Content Script فقط على `https://www.youtube.com/*`. ملف `page-bridge.js` مورد JavaScript خارجي مسموح به فقط لنطاق YouTube عبر `web_accessible_resources`، ولا يستخدم Inline JavaScript أو `eval`. هذا يحافظ على CSP الخاصة بـManifest V3.
+يحتوي `manifest.json` على `host_permissions` لنطاق `https://www.youtube.com/*` لأن Service Worker يحتاج إلى جلب Player Response ومسارات captions من YouTube. ملف `page-bridge.js` مورد JavaScript خارجي مسموح به فقط لنطاق YouTube عبر `web_accessible_resources`، ولا يستخدم Inline JavaScript أو `eval`. هذا يحافظ على CSP الخاصة بـManifest V3.
+
+## Current security model (v1.8+)
+
+The current implementation intentionally declares `https://www.youtube.com/*` as a host permission because the MV3 service worker must fetch YouTube player responses and caption tracks. Those requests are restricted to the exact HTTPS YouTube origin, validate video IDs and caption URLs, enforce response-size and timeout limits, deduplicate concurrent work, and keep only short-lived bounded caches.
+
+`page-bridge.js` is limited to the player operations that require YouTube's page-world API. Requests use an extension-generated nonce, exact-origin checks, an allowlisted command set, and strict payload validation. Its caption fallback can fetch only a validated `/api/timedtext` URL for the requested video, with credentials, a timeout, and a response-size limit; it cannot fetch arbitrary page URLs.
+
+Caption loading first reads the live preview player's caption tracks and translation languages, then tries the page-context timed-text request (which preserves YouTube's page session) before the bounded service-worker fallback. The result is installed as WebVTT cues on the overlay video. The timeline consumes YouTube's bounded storyboard specification and displays the matching sprite tile on hover, with a small LRU URL cache and cleanup when the overlay closes.
+
+The repository has no runtime npm dependencies. Run `node --test tests/caption-utils.test.mjs` (or `npm.cmd test` in Windows PowerShell) to execute the caption parsing and URL-validation regression tests before loading the unpacked extension in Chrome.

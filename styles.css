@@ -1,330 +1,6 @@
 .ytpm-no-scroll {
   overflow: hidden !important;
 }
-
-/* YouTube-inspired controls for the extension-owned overlay. The original
-   YouTube player is never moved into this frame. */
-.ytpm-overlay__frame {
-  width: min(96vw, 1600px) !important;
-  height: min(90vh, 900px) !important;
-  aspect-ratio: 16 / 9 !important;
-  border-radius: 2px !important;
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6) !important;
-}
-
-.ytpm-overlay__video {
-  position: absolute !important;
-  inset: 0 !important;
-  width: 100% !important;
-  height: 100% !important;
-  object-fit: contain !important;
-}
-
-.ytpm-overlay__controls {
-  right: 0 !important;
-  bottom: 0 !important;
-  left: 0 !important;
-  display: flex !important;
-  align-items: center !important;
-  justify-content: space-between !important;
-  gap: 0 !important;
-  flex-wrap: nowrap !important;
-  height: 59px !important;
-  min-height: 59px !important;
-  padding: 14px 10px 4px !important;
-  background: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.28) 24%, rgba(0, 0, 0, 0.92) 100%) !important;
-}
-
-.ytpm-overlay__left-controls,
-.ytpm-overlay__right-controls {
-  display: flex !important;
-  align-items: center !important;
-  height: 40px !important;
-  min-width: 0 !important;
-}
-
-.ytpm-overlay__left-controls {
-  flex: 1 1 0% !important;
-}
-
-.ytpm-overlay__right-controls {
-  flex: 0 0 auto !important;
-  margin-left: auto !important;
-}
-
-.ytpm-overlay__control-button {
-  flex: 0 0 40px !important;
-  width: 40px !important;
-  min-width: 40px !important;
-  height: 40px !important;
-  padding: 8px !important;
-  border-radius: 2px !important;
-  font-size: 0 !important;
-}
-
-.ytpm-overlay__control-button:hover,
-.ytpm-overlay__control-button:focus-visible {
-  background: rgba(255, 255, 255, 0.14) !important;
-  outline: none !important;
-}
-
-.ytpm-overlay__icon {
-  display: block !important;
-  width: 24px !important;
-  height: 24px !important;
-  overflow: visible !important;
-  fill: currentColor !important;
-  color: currentColor !important;
-  pointer-events: none !important;
-}
-
-.ytpm-overlay__icon [stroke] {
-  vector-effect: non-scaling-stroke !important;
-}
-
-.ytpm-overlay__volume-wrap {
-  display: flex !important;
-  align-items: center !important;
-  width: 40px !important;
-  height: 40px !important;
-  overflow: visible !important;
-  transition: width 160ms ease !important;
-}
-
-.ytpm-overlay__volume-wrap:hover,
-.ytpm-overlay__volume-wrap:focus-within {
-  width: 116px !important;
-}
-
-.ytpm-overlay__volume {
-  display: block !important;
-  width: 0 !important;
-  height: 4px !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  appearance: none !important;
-  -webkit-appearance: none !important;
-  border-radius: 2px !important;
-  background: linear-gradient(to right, #ffffff 0 var(--ytpm-volume-progress, 100%), rgba(255, 255, 255, 0.4) var(--ytpm-volume-progress, 100%) 100%) !important;
-  opacity: 0 !important;
-  pointer-events: none !important;
-  transition: width 160ms ease, opacity 160ms ease !important;
-}
-
-.ytpm-overlay__volume-wrap:hover .ytpm-overlay__volume,
-.ytpm-overlay__volume-wrap:focus-within .ytpm-overlay__volume {
-  width: 68px !important;
-  margin-right: 8px !important;
-  opacity: 1 !important;
-  pointer-events: auto !important;
-}
-
-.ytpm-overlay__volume::-webkit-slider-runnable-track {
-  height: 4px !important;
-  border-radius: 2px !important;
-  background: transparent !important;
-}
-
-.ytpm-overlay__volume::-webkit-slider-thumb {
-  width: 10px !important;
-  height: 10px !important;
-  margin-top: -3px !important;
-  appearance: none !important;
-  -webkit-appearance: none !important;
-  border: 0 !important;
-  border-radius: 50% !important;
-  background: #ffffff !important;
-}
-
-.ytpm-overlay__volume::-moz-range-track {
-  height: 4px !important;
-  border-radius: 2px !important;
-  background: rgba(255, 255, 255, 0.4) !important;
-}
-
-.ytpm-overlay__volume::-moz-range-progress {
-  height: 4px !important;
-  border-radius: 2px !important;
-  background: #ffffff !important;
-}
-
-.ytpm-overlay__volume::-moz-range-thumb {
-  width: 10px !important;
-  height: 10px !important;
-  border: 0 !important;
-  border-radius: 50% !important;
-  background: #ffffff !important;
-}
-
-.ytpm-overlay__time {
-  min-width: 98px !important;
-  margin-left: 4px !important;
-  color: rgba(255, 255, 255, 0.92) !important;
-  font-size: 13px !important;
-  font-variant-numeric: tabular-nums !important;
-  text-align: left !important;
-}
-
-.ytpm-overlay__seek {
-  right: 12px !important;
-  bottom: 51px !important;
-  left: 12px !important;
-  width: calc(100% - 24px) !important;
-  height: 4px !important;
-  border-radius: 0 !important;
-  background: linear-gradient(to right, #ff0033 0 var(--ytpm-seek-progress, 0%), rgba(255, 255, 255, 0.34) var(--ytpm-seek-progress, 0%) 100%) !important;
-  transition: height 100ms ease, opacity 180ms ease, transform 180ms ease !important;
-}
-
-.ytpm-overlay__seek:hover,
-.ytpm-overlay__seek:focus-visible {
-  height: 6px !important;
-}
-
-.ytpm-overlay__seek::-webkit-slider-runnable-track {
-  height: 4px !important;
-  border-radius: 0 !important;
-  background: transparent !important;
-}
-
-.ytpm-overlay__seek::-webkit-slider-thumb {
-  width: 12px !important;
-  height: 12px !important;
-  margin-top: -4px !important;
-  opacity: 0 !important;
-  transition: opacity 100ms ease !important;
-}
-
-.ytpm-overlay__seek:hover::-webkit-slider-thumb,
-.ytpm-overlay__seek:focus-visible::-webkit-slider-thumb {
-  opacity: 1 !important;
-}
-
-.ytpm-overlay__seek::-moz-range-track {
-  height: 4px !important;
-  border-radius: 0 !important;
-  background: transparent !important;
-}
-
-.ytpm-overlay__seek::-moz-range-progress {
-  height: 4px !important;
-  border-radius: 0 !important;
-  background: #ff0033 !important;
-}
-
-.ytpm-overlay__seek::-moz-range-thumb {
-  width: 12px !important;
-  height: 12px !important;
-  border: 0 !important;
-  border-radius: 50% !important;
-  background: #ff0033 !important;
-  opacity: 0 !important;
-}
-
-.ytpm-overlay__seek:hover::-moz-range-thumb,
-.ytpm-overlay__seek:focus-visible::-moz-range-thumb {
-  opacity: 1 !important;
-}
-
-.ytpm-overlay__quality-menu {
-  right: 0 !important;
-  bottom: calc(100% + 8px) !important;
-  min-width: 150px !important;
-  padding: 6px 0 !important;
-  border: 0 !important;
-  border-radius: 2px !important;
-  background: rgba(28, 28, 28, 0.98) !important;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55) !important;
-}
-
-.ytpm-overlay__quality-option {
-  min-height: 36px !important;
-  padding: 9px 16px !important;
-  border-radius: 0 !important;
-  font-size: 13px !important;
-}
-
-.ytpm-overlay__quality-option:hover,
-.ytpm-overlay__quality-option:focus-visible {
-  background: rgba(255, 255, 255, 0.16) !important;
-}
-
-.ytpm-overlay__close {
-  width: 40px !important;
-  height: 40px !important;
-  border: 0 !important;
-  border-radius: 2px !important;
-  background: rgba(0, 0, 0, 0.34) !important;
-  font-size: 0 !important;
-}
-
-.ytpm-overlay__close .ytpm-overlay__icon {
-  width: 26px !important;
-  height: 26px !important;
-}
-
-.ytpm-overlay__close:hover,
-.ytpm-overlay__close:focus-visible {
-  background: rgba(0, 0, 0, 0.7) !important;
-  outline: 2px solid rgba(255, 255, 255, 0.9) !important;
-  outline-offset: 2px !important;
-  transform: none !important;
-}
-
-@media (max-width: 600px) {
-  .ytpm-overlay__frame {
-    width: 100% !important;
-    height: min(86vh, 720px) !important;
-    border-radius: 0 !important;
-  }
-
-  .ytpm-overlay__controls {
-    height: 55px !important;
-    min-height: 55px !important;
-    padding: 14px 4px 3px !important;
-  }
-
-  .ytpm-overlay__control-button {
-    flex-basis: 36px !important;
-    width: 36px !important;
-    min-width: 36px !important;
-    height: 36px !important;
-    padding: 7px !important;
-  }
-
-  .ytpm-overlay__icon {
-    width: 22px !important;
-    height: 22px !important;
-  }
-
-  .ytpm-overlay__volume-wrap {
-    width: 36px !important;
-  }
-
-  .ytpm-overlay__volume-wrap:hover,
-  .ytpm-overlay__volume-wrap:focus-within {
-    width: 92px !important;
-  }
-
-  .ytpm-overlay__volume-wrap:hover .ytpm-overlay__volume,
-  .ytpm-overlay__volume-wrap:focus-within .ytpm-overlay__volume {
-    width: 48px !important;
-  }
-
-  .ytpm-overlay__time {
-    min-width: 72px !important;
-    margin-left: 0 !important;
-    font-size: 11px !important;
-  }
-
-  .ytpm-overlay__seek {
-    right: 8px !important;
-    bottom: 47px !important;
-    left: 8px !important;
-    width: calc(100% - 16px) !important;
-  }
-}
-
 /* Keep range controls left-to-right on RTL YouTube pages. */
 .ytpm-overlay__frame,
 .ytpm-overlay__seek,
@@ -760,6 +436,64 @@ html[dark] .ytpm-maximize-button {
     right: max(8px, env(safe-area-inset-right)) !important;
     width: 38px !important;
     height: 38px !important;
+  }
+}
+
+/* Timeline storyboard preview. The image is a bounded sprite sheet; the
+   extension positions the selected tile inside this clipped viewport. */
+.ytpm-overlay__timeline-preview {
+  position: absolute !important;
+  left: var(--ytpm-timeline-preview-left, 50%) !important;
+  bottom: 62px !important;
+  z-index: 11 !important;
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+  border: 1px solid rgba(255, 255, 255, 0.34) !important;
+  border-radius: 4px !important;
+  background: #000000 !important;
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.62) !important;
+  pointer-events: none !important;
+  transform: translateX(-50%) !important;
+}
+
+.ytpm-overlay__timeline-preview[hidden] {
+  display: none !important;
+}
+
+.ytpm-overlay__timeline-preview-image {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  display: block !important;
+  max-width: none !important;
+  border: 0 !important;
+  object-fit: fill !important;
+  pointer-events: none !important;
+}
+
+.ytpm-overlay__timeline-preview-time {
+  position: absolute !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  box-sizing: border-box !important;
+  padding: 3px 5px !important;
+  background: rgba(0, 0, 0, 0.84) !important;
+  color: #ffffff !important;
+  direction: ltr !important;
+  font: 600 11px/1.1 Arial, sans-serif !important;
+  text-align: center !important;
+  unicode-bidi: isolate !important;
+}
+
+.ytpm-overlay__frame.ytpm-controls-hidden .ytpm-overlay__timeline-preview {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+@media (max-width: 600px) {
+  .ytpm-overlay__timeline-preview {
+    bottom: 60px !important;
   }
 }
 

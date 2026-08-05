@@ -1,0 +1,7 @@
+{
+  "name": "youtube-preview-maximizer",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/caption-utils.test.mjs"
+  }
+}

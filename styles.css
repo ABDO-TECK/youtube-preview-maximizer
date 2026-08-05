@@ -1,0 +1,1056 @@
+.ytpm-no-scroll {
+  overflow: hidden !important;
+}
+
+/* YouTube-inspired controls for the extension-owned overlay. The original
+   YouTube player is never moved into this frame. */
+.ytpm-overlay__frame {
+  width: min(96vw, 1600px) !important;
+  height: min(90vh, 900px) !important;
+  aspect-ratio: 16 / 9 !important;
+  border-radius: 2px !important;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6) !important;
+}
+
+.ytpm-overlay__video {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: contain !important;
+}
+
+.ytpm-overlay__controls {
+  right: 0 !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 0 !important;
+  flex-wrap: nowrap !important;
+  height: 59px !important;
+  min-height: 59px !important;
+  padding: 14px 10px 4px !important;
+  background: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.28) 24%, rgba(0, 0, 0, 0.92) 100%) !important;
+}
+
+.ytpm-overlay__left-controls,
+.ytpm-overlay__right-controls {
+  display: flex !important;
+  align-items: center !important;
+  height: 40px !important;
+  min-width: 0 !important;
+}
+
+.ytpm-overlay__left-controls {
+  flex: 1 1 0% !important;
+}
+
+.ytpm-overlay__right-controls {
+  flex: 0 0 auto !important;
+  margin-left: auto !important;
+}
+
+.ytpm-overlay__control-button {
+  flex: 0 0 40px !important;
+  width: 40px !important;
+  min-width: 40px !important;
+  height: 40px !important;
+  padding: 8px !important;
+  border-radius: 2px !important;
+  font-size: 0 !important;
+}
+
+.ytpm-overlay__control-button:hover,
+.ytpm-overlay__control-button:focus-visible {
+  background: rgba(255, 255, 255, 0.14) !important;
+  outline: none !important;
+}
+
+.ytpm-overlay__icon {
+  display: block !important;
+  width: 24px !important;
+  height: 24px !important;
+  overflow: visible !important;
+  fill: currentColor !important;
+  color: currentColor !important;
+  pointer-events: none !important;
+}
+
+.ytpm-overlay__icon [stroke] {
+  vector-effect: non-scaling-stroke !important;
+}
+
+.ytpm-overlay__volume-wrap {
+  display: flex !important;
+  align-items: center !important;
+  width: 40px !important;
+  height: 40px !important;
+  overflow: visible !important;
+  transition: width 160ms ease !important;
+}
+
+.ytpm-overlay__volume-wrap:hover,
+.ytpm-overlay__volume-wrap:focus-within {
+  width: 116px !important;
+}
+
+.ytpm-overlay__volume {
+  display: block !important;
+  width: 0 !important;
+  height: 4px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  border-radius: 2px !important;
+  background: linear-gradient(to right, #ffffff 0 var(--ytpm-volume-progress, 100%), rgba(255, 255, 255, 0.4) var(--ytpm-volume-progress, 100%) 100%) !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: width 160ms ease, opacity 160ms ease !important;
+}
+
+.ytpm-overlay__volume-wrap:hover .ytpm-overlay__volume,
+.ytpm-overlay__volume-wrap:focus-within .ytpm-overlay__volume {
+  width: 68px !important;
+  margin-right: 8px !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}
+
+.ytpm-overlay__volume::-webkit-slider-runnable-track {
+  height: 4px !important;
+  border-radius: 2px !important;
+  background: transparent !important;
+}
+
+.ytpm-overlay__volume::-webkit-slider-thumb {
+  width: 10px !important;
+  height: 10px !important;
+  margin-top: -3px !important;
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  border: 0 !important;
+  border-radius: 50% !important;
+  background: #ffffff !important;
+}
+
+.ytpm-overlay__volume::-moz-range-track {
+  height: 4px !important;
+  border-radius: 2px !important;
+  background: rgba(255, 255, 255, 0.4) !important;
+}
+
+.ytpm-overlay__volume::-moz-range-progress {
+  height: 4px !important;
+  border-radius: 2px !important;
+  background: #ffffff !important;
+}
+
+.ytpm-overlay__volume::-moz-range-thumb {
+  width: 10px !important;
+  height: 10px !important;
+  border: 0 !important;
+  border-radius: 50% !important;
+  background: #ffffff !important;
+}
+
+.ytpm-overlay__time {
+  min-width: 98px !important;
+  margin-left: 4px !important;
+  color: rgba(255, 255, 255, 0.92) !important;
+  font-size: 13px !important;
+  font-variant-numeric: tabular-nums !important;
+  text-align: left !important;
+}
+
+.ytpm-overlay__seek {
+  right: 12px !important;
+  bottom: 51px !important;
+  left: 12px !important;
+  width: calc(100% - 24px) !important;
+  height: 4px !important;
+  border-radius: 0 !important;
+  background: linear-gradient(to right, #ff0033 0 var(--ytpm-seek-progress, 0%), rgba(255, 255, 255, 0.34) var(--ytpm-seek-progress, 0%) 100%) !important;
+  transition: height 100ms ease, opacity 180ms ease, transform 180ms ease !important;
+}
+
+.ytpm-overlay__seek:hover,
+.ytpm-overlay__seek:focus-visible {
+  height: 6px !important;
+}
+
+.ytpm-overlay__seek::-webkit-slider-runnable-track {
+  height: 4px !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+}
+
+.ytpm-overlay__seek::-webkit-slider-thumb {
+  width: 12px !important;
+  height: 12px !important;
+  margin-top: -4px !important;
+  opacity: 0 !important;
+  transition: opacity 100ms ease !important;
+}
+
+.ytpm-overlay__seek:hover::-webkit-slider-thumb,
+.ytpm-overlay__seek:focus-visible::-webkit-slider-thumb {
+  opacity: 1 !important;
+}
+
+.ytpm-overlay__seek::-moz-range-track {
+  height: 4px !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+}
+
+.ytpm-overlay__seek::-moz-range-progress {
+  height: 4px !important;
+  border-radius: 0 !important;
+  background: #ff0033 !important;
+}
+
+.ytpm-overlay__seek::-moz-range-thumb {
+  width: 12px !important;
+  height: 12px !important;
+  border: 0 !important;
+  border-radius: 50% !important;
+  background: #ff0033 !important;
+  opacity: 0 !important;
+}
+
+.ytpm-overlay__seek:hover::-moz-range-thumb,
+.ytpm-overlay__seek:focus-visible::-moz-range-thumb {
+  opacity: 1 !important;
+}
+
+.ytpm-overlay__quality-menu {
+  right: 0 !important;
+  bottom: calc(100% + 8px) !important;
+  min-width: 150px !important;
+  padding: 6px 0 !important;
+  border: 0 !important;
+  border-radius: 2px !important;
+  background: rgba(28, 28, 28, 0.98) !important;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55) !important;
+}
+
+.ytpm-overlay__quality-option {
+  min-height: 36px !important;
+  padding: 9px 16px !important;
+  border-radius: 0 !important;
+  font-size: 13px !important;
+}
+
+.ytpm-overlay__quality-option:hover,
+.ytpm-overlay__quality-option:focus-visible {
+  background: rgba(255, 255, 255, 0.16) !important;
+}
+
+.ytpm-overlay__close {
+  width: 40px !important;
+  height: 40px !important;
+  border: 0 !important;
+  border-radius: 2px !important;
+  background: rgba(0, 0, 0, 0.34) !important;
+  font-size: 0 !important;
+}
+
+.ytpm-overlay__close .ytpm-overlay__icon {
+  width: 26px !important;
+  height: 26px !important;
+}
+
+.ytpm-overlay__close:hover,
+.ytpm-overlay__close:focus-visible {
+  background: rgba(0, 0, 0, 0.7) !important;
+  outline: 2px solid rgba(255, 255, 255, 0.9) !important;
+  outline-offset: 2px !important;
+  transform: none !important;
+}
+
+@media (max-width: 600px) {
+  .ytpm-overlay__frame {
+    width: 100% !important;
+    height: min(86vh, 720px) !important;
+    border-radius: 0 !important;
+  }
+
+  .ytpm-overlay__controls {
+    height: 55px !important;
+    min-height: 55px !important;
+    padding: 14px 4px 3px !important;
+  }
+
+  .ytpm-overlay__control-button {
+    flex-basis: 36px !important;
+    width: 36px !important;
+    min-width: 36px !important;
+    height: 36px !important;
+    padding: 7px !important;
+  }
+
+  .ytpm-overlay__icon {
+    width: 22px !important;
+    height: 22px !important;
+  }
+
+  .ytpm-overlay__volume-wrap {
+    width: 36px !important;
+  }
+
+  .ytpm-overlay__volume-wrap:hover,
+  .ytpm-overlay__volume-wrap:focus-within {
+    width: 92px !important;
+  }
+
+  .ytpm-overlay__volume-wrap:hover .ytpm-overlay__volume,
+  .ytpm-overlay__volume-wrap:focus-within .ytpm-overlay__volume {
+    width: 48px !important;
+  }
+
+  .ytpm-overlay__time {
+    min-width: 72px !important;
+    margin-left: 0 !important;
+    font-size: 11px !important;
+  }
+
+  .ytpm-overlay__seek {
+    right: 8px !important;
+    bottom: 47px !important;
+    left: 8px !important;
+    width: calc(100% - 16px) !important;
+  }
+}
+
+/* Keep range controls left-to-right on RTL YouTube pages. */
+.ytpm-overlay__frame,
+.ytpm-overlay__seek,
+.ytpm-overlay__volume {
+  direction: ltr !important;
+  unicode-bidi: isolate !important;
+}
+
+.ytpm-thumbnail-host {
+  position: relative !important;
+  z-index: 1 !important;
+}
+
+.ytpm-preview-host {
+  position: relative !important;
+  overflow: visible !important;
+}
+
+.ytpm-maximize-button {
+  position: absolute !important;
+  top: 8px !important;
+  right: 8px !important;
+  z-index: 20 !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 32px !important;
+  height: 32px !important;
+  padding: 0 !important;
+  border: 1px solid rgba(255, 255, 255, 0.55) !important;
+  border-radius: 6px !important;
+  background: rgba(15, 15, 15, 0.82) !important;
+  color: #ffffff !important;
+  font: 700 18px/1 Arial, sans-serif !important;
+  text-align: center !important;
+  cursor: pointer !important;
+  opacity: 0.9 !important;
+  pointer-events: auto !important;
+  transform: translateY(0) !important;
+  transition: opacity 140ms ease, transform 140ms ease, background 140ms ease !important;
+}
+
+.ytpm-card--decorated:hover .ytpm-maximize-button,
+.ytpm-thumbnail-host:hover .ytpm-maximize-button,
+.ytpm-maximize-button:focus,
+.ytpm-maximize-button:focus-visible {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  transform: translateY(0) !important;
+}
+
+.ytpm-maximize-button:hover,
+.ytpm-maximize-button:focus-visible {
+  background: rgba(255, 0, 0, 0.92) !important;
+  outline: 2px solid rgba(255, 255, 255, 0.95) !important;
+  outline-offset: 2px !important;
+}
+
+.ytpm-maximize-button:active {
+  transform: translateY(1px) !important;
+}
+
+.ytpm-maximize-button--preview {
+  z-index: 2147483647 !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}
+
+html[dark] .ytpm-maximize-button {
+  background: rgba(0, 0, 0, 0.78) !important;
+}
+
+.ytpm-overlay {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483647 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  box-sizing: border-box !important;
+  padding: clamp(16px, 3vw, 48px) !important;
+  background: rgba(0, 0, 0, 0.86) !important;
+  color: #ffffff !important;
+  color-scheme: dark !important;
+  isolation: isolate !important;
+}
+
+.ytpm-overlay__frame {
+  position: relative !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: min(96vw, 1600px) !important;
+  height: min(88vh, 900px) !important;
+  aspect-ratio: 16 / 9 !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+  border-radius: 12px !important;
+  background: #000000 !important;
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.55) !important;
+}
+
+.ytpm-overlay__video {
+  display: block !important;
+  width: 100% !important;
+  height: 100% !important;
+  max-width: 100% !important;
+  max-height: 100% !important;
+  object-fit: contain !important;
+  background: #000000 !important;
+}
+
+.ytpm-overlay__video::cue {
+  background: rgba(0, 0, 0, 0.78) !important;
+  color: #ffffff !important;
+  font: 600 1.05em/1.35 Arial, sans-serif !important;
+}
+
+.ytpm-overlay__frame:fullscreen {
+  width: 100vw !important;
+  height: 100vh !important;
+  border-radius: 0 !important;
+}
+
+.ytpm-overlay__controls {
+  position: absolute !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  z-index: 8 !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+  min-height: 54px !important;
+  padding: 14px 12px 7px !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.92) 45%, rgba(0, 0, 0, 0.98)) !important;
+  box-sizing: border-box !important;
+  color: #ffffff !important;
+  direction: ltr !important;
+  font: 400 13px/1 Arial, sans-serif !important;
+  unicode-bidi: isolate !important;
+  opacity: 1 !important;
+  transform: translateY(0) !important;
+  transition: opacity 180ms ease, transform 180ms ease !important;
+}
+
+.ytpm-overlay__control-button {
+  flex: 0 0 auto !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-width: 36px !important;
+  height: 36px !important;
+  padding: 0 7px !important;
+  border: 0 !important;
+  border-radius: 3px !important;
+  background: transparent !important;
+  color: #ffffff !important;
+  font: 700 16px/1 Arial, sans-serif !important;
+  cursor: pointer !important;
+  user-select: none !important;
+  transition: background 140ms ease, border-color 140ms ease, opacity 140ms ease !important;
+}
+
+.ytpm-overlay__control-button:hover,
+.ytpm-overlay__control-button:focus-visible {
+  background: rgba(255, 255, 255, 0.18) !important;
+  outline: 2px solid rgba(255, 255, 255, 0.84) !important;
+  outline-offset: 1px !important;
+}
+
+.ytpm-overlay__control-button:disabled {
+  cursor: not-allowed !important;
+  opacity: 0.42 !important;
+}
+
+.ytpm-overlay__seek {
+  position: absolute !important;
+  right: 12px !important;
+  bottom: 50px !important;
+  left: 12px !important;
+  z-index: 10 !important;
+  display: block !important;
+  width: calc(100% - 24px) !important;
+  min-width: 0 !important;
+  height: 5px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  border-radius: 3px !important;
+  background: linear-gradient(to right, #ff0000 0 var(--ytpm-seek-progress, 0%), rgba(255, 255, 255, 0.38) var(--ytpm-seek-progress, 0%) 100%) !important;
+  accent-color: #ff0000 !important;
+  cursor: pointer !important;
+  opacity: 1 !important;
+  transform: translateY(0) !important;
+  transition: opacity 180ms ease, transform 180ms ease, height 120ms ease !important;
+}
+
+.ytpm-overlay__seek::-webkit-slider-runnable-track {
+  height: 5px !important;
+  border-radius: 3px !important;
+  background: transparent !important;
+}
+
+.ytpm-overlay__seek::-webkit-slider-thumb {
+  width: 13px !important;
+  height: 13px !important;
+  margin-top: -4px !important;
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  border: 0 !important;
+  border-radius: 50% !important;
+  background: #ff0000 !important;
+  box-shadow: 0 0 0 2px rgba(255, 0, 0, 0.14) !important;
+}
+
+.ytpm-overlay__seek::-moz-range-track {
+  height: 5px !important;
+  border-radius: 3px !important;
+  background: transparent !important;
+}
+
+.ytpm-overlay__seek::-moz-range-progress {
+  height: 5px !important;
+  border-radius: 3px !important;
+  background: #ff0000 !important;
+}
+
+.ytpm-overlay__seek::-moz-range-thumb {
+  width: 13px !important;
+  height: 13px !important;
+  border: 0 !important;
+  border-radius: 50% !important;
+  background: #ff0000 !important;
+}
+
+.ytpm-overlay__seek:disabled {
+  cursor: not-allowed !important;
+  opacity: 0.45 !important;
+}
+
+.ytpm-overlay__time {
+  flex: 0 0 auto !important;
+  min-width: 82px !important;
+  color: rgba(255, 255, 255, 0.92) !important;
+  font-size: 12px !important;
+  font-variant-numeric: tabular-nums !important;
+  text-align: center !important;
+  white-space: nowrap !important;
+}
+
+.ytpm-overlay__quality {
+  position: relative !important;
+  flex: 0 0 auto !important;
+  display: inline-flex !important;
+}
+
+.ytpm-overlay__quality-menu {
+  position: absolute !important;
+  right: 0 !important;
+  bottom: calc(100% + 8px) !important;
+  z-index: 12 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  min-width: 126px !important;
+  padding: 6px !important;
+  border: 1px solid rgba(255, 255, 255, 0.18) !important;
+  border-radius: 2px !important;
+  background: rgba(28, 28, 28, 0.98) !important;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55) !important;
+  direction: ltr !important;
+  unicode-bidi: isolate !important;
+}
+
+.ytpm-overlay__quality-menu[hidden] {
+  display: none !important;
+}
+
+.ytpm-overlay__quality-option {
+  display: block !important;
+  width: 100% !important;
+  padding: 9px 11px !important;
+  border: 0 !important;
+  border-radius: 2px !important;
+  background: transparent !important;
+  color: #ffffff !important;
+  font: 400 13px/1.2 Arial, sans-serif !important;
+  text-align: left !important;
+  cursor: pointer !important;
+}
+
+.ytpm-overlay__quality-option:hover,
+.ytpm-overlay__quality-option:focus-visible {
+  background: rgba(255, 255, 255, 0.14) !important;
+  outline: none !important;
+}
+
+.ytpm-overlay__frame.ytpm-controls-hidden .ytpm-overlay__controls,
+.ytpm-overlay__frame.ytpm-controls-hidden .ytpm-overlay__seek {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transform: translateY(12px) !important;
+}
+
+.ytpm-overlay__frame.ytpm-controls-hidden {
+  cursor: none !important;
+}
+
+.ytpm-overlay__frame.ytpm-controls-hidden .ytpm-overlay__seek {
+  height: 3px !important;
+}
+
+.ytpm-overlay__close {
+  position: absolute !important;
+  top: max(12px, env(safe-area-inset-top)) !important;
+  right: max(12px, env(safe-area-inset-right)) !important;
+  z-index: 2 !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 42px !important;
+  height: 42px !important;
+  padding: 0 !important;
+  border: 1px solid rgba(255, 255, 255, 0.58) !important;
+  border-radius: 50% !important;
+  background: rgba(0, 0, 0, 0.68) !important;
+  color: #ffffff !important;
+  font: 400 31px/1 Arial, sans-serif !important;
+  cursor: pointer !important;
+  transition: background 140ms ease, transform 140ms ease !important;
+}
+
+.ytpm-overlay__close:hover,
+.ytpm-overlay__close:focus-visible {
+  background: rgba(255, 0, 0, 0.92) !important;
+  outline: 2px solid #ffffff !important;
+  outline-offset: 3px !important;
+  transform: scale(1.04) !important;
+}
+
+.ytpm-overlay__close:focus-visible {
+  outline: 2px solid #ffffff !important;
+}
+
+.ytpm-video-placeholder {
+  display: block !important;
+  min-width: 1px !important;
+  min-height: 1px !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+.ytpm-notice {
+  position: fixed !important;
+  left: 50% !important;
+  bottom: 24px !important;
+  z-index: 2147483646 !important;
+  box-sizing: border-box !important;
+  width: max-content !important;
+  max-width: min(90vw, 520px) !important;
+  padding: 10px 14px !important;
+  border: 1px solid rgba(255, 255, 255, 0.18) !important;
+  border-radius: 8px !important;
+  background: rgba(20, 20, 20, 0.94) !important;
+  color: #ffffff !important;
+  direction: ltr !important;
+  unicode-bidi: isolate !important;
+  font: 400 13px/1.4 Arial, sans-serif !important;
+  text-align: center !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transform: translate(-50%, 10px) !important;
+  transition: opacity 160ms ease, transform 160ms ease !important;
+}
+
+.ytpm-notice--visible {
+  opacity: 1 !important;
+  transform: translate(-50%, 0) !important;
+}
+
+@media (max-width: 600px) {
+  .ytpm-maximize-button {
+    top: 6px !important;
+    right: 6px !important;
+    width: 30px !important;
+    height: 30px !important;
+  }
+
+  .ytpm-overlay {
+    padding: 12px !important;
+  }
+
+  .ytpm-overlay__frame {
+    width: 100% !important;
+    height: min(86vh, 720px) !important;
+    border-radius: 8px !important;
+  }
+
+  .ytpm-overlay__controls {
+    right: 0 !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    flex-wrap: wrap !important;
+    gap: 5px !important;
+    min-height: 54px !important;
+    padding: 14px 7px 6px !important;
+  }
+
+  .ytpm-overlay__control-button {
+    min-width: 30px !important;
+    height: 28px !important;
+    padding: 0 6px !important;
+  }
+
+  .ytpm-overlay__seek {
+    right: 8px !important;
+    bottom: 50px !important;
+    left: 8px !important;
+    width: calc(100% - 16px) !important;
+  }
+
+  .ytpm-overlay__time {
+    min-width: 68px !important;
+    font-size: 12px !important;
+  }
+
+  .ytpm-overlay__close {
+    top: max(8px, env(safe-area-inset-top)) !important;
+    right: max(8px, env(safe-area-inset-right)) !important;
+    width: 38px !important;
+    height: 38px !important;
+  }
+}
+
+/* Final cascade for the extension-owned YouTube-style toolbar. */
+.ytpm-overlay__frame {
+  width: min(96vw, 1600px) !important;
+  height: min(90vh, 900px) !important;
+  aspect-ratio: 16 / 9 !important;
+  border-radius: 2px !important;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6) !important;
+}
+
+.ytpm-overlay__video {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: contain !important;
+}
+
+.ytpm-overlay__controls {
+  right: 0 !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 0 !important;
+  flex-wrap: nowrap !important;
+  height: 59px !important;
+  min-height: 59px !important;
+  padding: 14px 10px 4px !important;
+  background: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.28) 24%, rgba(0, 0, 0, 0.92) 100%) !important;
+}
+
+.ytpm-overlay__left-controls,
+.ytpm-overlay__right-controls {
+  display: flex !important;
+  align-items: center !important;
+  height: 40px !important;
+  min-width: 0 !important;
+}
+
+.ytpm-overlay__left-controls {
+  flex: 1 1 0% !important;
+}
+
+.ytpm-overlay__right-controls {
+  flex: 0 0 auto !important;
+  margin-left: auto !important;
+}
+
+.ytpm-overlay__control-button {
+  flex: 0 0 40px !important;
+  width: 40px !important;
+  min-width: 40px !important;
+  height: 40px !important;
+  padding: 8px !important;
+  border-radius: 2px !important;
+  font-size: 0 !important;
+}
+
+.ytpm-overlay__control-button:hover,
+.ytpm-overlay__control-button:focus-visible {
+  background: rgba(255, 255, 255, 0.14) !important;
+  outline: none !important;
+}
+
+.ytpm-overlay__icon {
+  display: block !important;
+  width: 24px !important;
+  height: 24px !important;
+  overflow: visible !important;
+  fill: currentColor !important;
+  color: currentColor !important;
+  pointer-events: none !important;
+}
+
+.ytpm-overlay__volume-wrap {
+  display: flex !important;
+  align-items: center !important;
+  width: 40px !important;
+  height: 40px !important;
+  overflow: visible !important;
+  transition: width 160ms ease !important;
+}
+
+.ytpm-overlay__volume-wrap:hover,
+.ytpm-overlay__volume-wrap:focus-within {
+  width: 116px !important;
+}
+
+.ytpm-overlay__volume {
+  display: block !important;
+  width: 0 !important;
+  height: 4px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  border-radius: 2px !important;
+  background: linear-gradient(to right, #ffffff 0 var(--ytpm-volume-progress, 100%), rgba(255, 255, 255, 0.4) var(--ytpm-volume-progress, 100%) 100%) !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: width 160ms ease, opacity 160ms ease !important;
+}
+
+.ytpm-overlay__volume-wrap:hover .ytpm-overlay__volume,
+.ytpm-overlay__volume-wrap:focus-within .ytpm-overlay__volume {
+  width: 68px !important;
+  margin-right: 8px !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+}
+
+.ytpm-overlay__time {
+  min-width: 98px !important;
+  margin-left: 4px !important;
+  color: rgba(255, 255, 255, 0.92) !important;
+  font-size: 13px !important;
+  font-variant-numeric: tabular-nums !important;
+  text-align: left !important;
+}
+
+.ytpm-overlay__seek {
+  right: 12px !important;
+  bottom: 51px !important;
+  left: 12px !important;
+  width: calc(100% - 24px) !important;
+  height: 4px !important;
+  border-radius: 0 !important;
+  background: linear-gradient(to right, #ff0033 0 var(--ytpm-seek-progress, 0%), rgba(255, 255, 255, 0.34) var(--ytpm-seek-progress, 0%) 100%) !important;
+}
+
+.ytpm-overlay__seek:hover,
+.ytpm-overlay__seek:focus-visible {
+  height: 6px !important;
+}
+
+.ytpm-overlay__seek::-webkit-slider-runnable-track {
+  height: 4px !important;
+  background: transparent !important;
+}
+
+.ytpm-overlay__seek::-webkit-slider-thumb {
+  width: 12px !important;
+  height: 12px !important;
+  margin-top: -4px !important;
+  opacity: 0 !important;
+  transition: opacity 100ms ease !important;
+}
+
+.ytpm-overlay__seek:hover::-webkit-slider-thumb,
+.ytpm-overlay__seek:focus-visible::-webkit-slider-thumb,
+.ytpm-overlay__seek:hover::-moz-range-thumb,
+.ytpm-overlay__seek:focus-visible::-moz-range-thumb {
+  opacity: 1 !important;
+}
+
+.ytpm-overlay__seek::-moz-range-progress {
+  height: 4px !important;
+  background: #ff0033 !important;
+}
+
+.ytpm-overlay__seek::-moz-range-thumb {
+  width: 12px !important;
+  height: 12px !important;
+  border: 0 !important;
+  border-radius: 50% !important;
+  background: #ff0033 !important;
+  opacity: 0 !important;
+}
+
+.ytpm-overlay__quality-menu {
+  right: 0 !important;
+  bottom: calc(100% + 8px) !important;
+  min-width: 150px !important;
+  padding: 6px 0 !important;
+  border: 0 !important;
+  border-radius: 2px !important;
+  background: rgba(28, 28, 28, 0.98) !important;
+}
+
+.ytpm-overlay__quality-option {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 18px !important;
+  min-height: 36px !important;
+  padding: 9px 16px !important;
+  border-radius: 0 !important;
+  text-align: left !important;
+}
+
+.ytpm-overlay__quality-label {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+}
+
+.ytpm-overlay__quality-check {
+  flex: 0 0 18px !important;
+  color: #3ea6ff !important;
+  font-size: 18px !important;
+  font-weight: 700 !important;
+  line-height: 1 !important;
+  opacity: 0 !important;
+  text-align: right !important;
+}
+
+.ytpm-overlay__quality-option--selected .ytpm-overlay__quality-check {
+  opacity: 1 !important;
+}
+
+.ytpm-overlay__quality-option--selected {
+  background: rgba(255, 255, 255, 0.08) !important;
+}
+
+.ytpm-overlay__close {
+  width: 40px !important;
+  height: 40px !important;
+  border: 0 !important;
+  border-radius: 2px !important;
+  background: rgba(0, 0, 0, 0.34) !important;
+  font-size: 0 !important;
+}
+
+.ytpm-overlay__close .ytpm-overlay__icon {
+  width: 26px !important;
+  height: 26px !important;
+}
+
+.ytpm-overlay__close {
+  transition: opacity 180ms ease, transform 180ms ease, background 140ms ease !important;
+}
+
+.ytpm-overlay__frame.ytpm-controls-hidden .ytpm-overlay__close {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transform: translateY(-8px) !important;
+}
+
+@media (max-width: 600px) {
+  .ytpm-overlay__frame {
+    width: 100% !important;
+    height: min(86vh, 720px) !important;
+    border-radius: 0 !important;
+  }
+
+  .ytpm-overlay__controls {
+    height: 55px !important;
+    min-height: 55px !important;
+    padding: 14px 4px 3px !important;
+  }
+
+  .ytpm-overlay__control-button {
+    flex-basis: 36px !important;
+    width: 36px !important;
+    min-width: 36px !important;
+    height: 36px !important;
+    padding: 7px !important;
+  }
+
+  .ytpm-overlay__icon {
+    width: 22px !important;
+    height: 22px !important;
+  }
+
+  .ytpm-overlay__volume-wrap {
+    width: 36px !important;
+  }
+
+  .ytpm-overlay__volume-wrap:hover,
+  .ytpm-overlay__volume-wrap:focus-within {
+    width: 92px !important;
+  }
+
+  .ytpm-overlay__volume-wrap:hover .ytpm-overlay__volume,
+  .ytpm-overlay__volume-wrap:focus-within .ytpm-overlay__volume {
+    width: 48px !important;
+  }
+
+  .ytpm-overlay__time {
+    min-width: 72px !important;
+    margin-left: 0 !important;
+    font-size: 11px !important;
+  }
+
+  .ytpm-overlay__seek {
+    right: 8px !important;
+    bottom: 47px !important;
+    left: 8px !important;
+    width: calc(100% - 16px) !important;
+  }
+}

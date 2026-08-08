@@ -7,6 +7,10 @@ const source = fs.readFileSync(
   new URL('../caption-utils.js', import.meta.url),
   'utf8'
 );
+const stylesSource = fs.readFileSync(
+  new URL('../styles.css', import.meta.url),
+  'utf8'
+);
 const sandbox = {
   URL,
   location: {
@@ -83,35 +87,281 @@ test('builds a bounded caption catalog and discards unsafe tracks', () => {
   assert.equal(catalog.translationLanguages[0].languageCode, 'es');
 });
 
-test('parses a YouTube storyboard spec and selects a bounded sprite tile', () => {
+test('normalizes native caption text and state conservatively', () => {
+  assert.equal(
+    utils.normalizeCaptionLines([' Hello  world ', 'Hello world', 'Next\r\nline']),
+    'Hello world\nNext\nline'
+  );
+  assert.equal(utils.normalizeCaptionLines(['  ', '\n', '\t']), '');
+  assert.equal(utils.normalizeCaptionLines(['First sentence']), 'First sentence');
+  assert.equal(utils.normalizeCaptionLines(['Second sentence']), 'Second sentence');
+  assert.equal(
+    utils.normalizeCaptionLines(['Hello there', 'How are you?']),
+    'Hello there\nHow are you?'
+  );
+  assert.equal(utils.normalizeCaptionLines(['Next caption']), 'Next caption');
+  assert.equal(utils.resolveCaptionEnabledState(false, true, true), false);
+  assert.equal(utils.resolveCaptionEnabledState(true, false, false), true);
+  assert.equal(utils.resolveCaptionEnabledState(null, false, true), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(utils.getCaptionTogglePlan(false, true))), {
+    desiredEnabled: true,
+    shouldChange: true
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(utils.getCaptionTogglePlan(true, true))), {
+    desiredEnabled: true,
+    shouldChange: false
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(utils.normalizeCaptionState({ available: true, enabled: true }))), {
+    available: true,
+    enabled: true
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(utils.normalizeCaptionState({ available: false, enabled: true }))), {
+    available: false,
+    enabled: false
+  });
+});
+
+test('keeps seek UI pending until one authoritative commit is confirmed', () => {
+  assert.equal(utils.clampSeekTime(-4, 300), 0);
+  assert.equal(utils.clampSeekTime(138, 300), 138);
+  assert.equal(utils.clampSeekTime(999, 300), 300);
+  assert.equal(
+    utils.getSeekDisplayTime(130, 138, false, true, 300),
+    138
+  );
+  assert.equal(
+    utils.getSeekDisplayTime(130, 138, false, false, 300),
+    130
+  );
+  assert.equal(utils.isSeekWithinTolerance(138, 138, 0.75), true);
+  assert.equal(utils.isSeekWithinTolerance(130, 138, 0.75), false);
+  assert.equal(utils.isSeekWithinTolerance(15.85, 16, 0.5), true);
+  assert.equal(utils.isSeekWithinTolerance(13, 16, 0.5), false);
+
+  assert.equal(utils.getSeekCommitPlan(13, 16, 300, 0.15).shouldSeek, true);
+  assert.equal(utils.getSeekCommitPlan(13, 18, 300, 0.15).shouldSeek, true);
+  assert.equal(utils.getSeekCommitPlan(13, 23, 300, 0.15).shouldSeek, true);
+  assert.equal(utils.getSeekCommitPlan(13, 13.05, 300, 0.15).shouldSeek, false);
+
+  const buffered = [{ start: 10, end: 20 }];
+  assert.equal(utils.isTimeBuffered(buffered, 16, 0.05), true);
+  assert.equal(utils.isTimeBuffered(buffered, 18, 0.05), true);
+  assert.equal(utils.isTimeBuffered(buffered, 21, 0.05), false);
+  assert.equal(utils.isTimeBuffered(buffered, 10, 0), true);
+
+  const currentRequest = { active: true, requestId: 2 };
+  assert.equal(utils.isSeekRequestCurrent(currentRequest, 1), false);
+  assert.equal(utils.isSeekRequestCurrent(currentRequest, 2), true);
+  assert.equal(utils.getSeekController(true), 'player');
+  assert.equal(utils.getSeekController(false), 'video');
+  assert.equal(utils.isSeekWithinTolerance(130, 130, 0.75), true);
+});
+
+test('selects caption windows by mutation generation without losing multiline cues', () => {
+  let active = utils.selectCaptionWindowGeneration([], ['A'], ['A']);
+  assert.deepEqual(JSON.parse(JSON.stringify(active)), ['A']);
+
+  active = utils.selectCaptionWindowGeneration(active, ['B'], ['A', 'B']);
+  assert.deepEqual(JSON.parse(JSON.stringify(active)), ['B']);
+  assert.equal(utils.normalizeCaptionLines(['line 1', 'line 2']), 'line 1\nline 2');
+
+  active = utils.selectCaptionWindowGeneration(active, [], ['A', 'B']);
+  assert.deepEqual(JSON.parse(JSON.stringify(active)), ['B']);
+
+  active = utils.selectCaptionWindowGeneration(active, ['C'], ['A', 'B', 'C']);
+  assert.deepEqual(JSON.parse(JSON.stringify(active)), ['C']);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(utils.selectCaptionWindowGeneration(active, [], ['A', 'B']))),
+    []
+  );
+});
+
+test('exposes the CC pressed-state visual hook without changing its accessible label', () => {
+  assert.equal(utils.isCaptionButtonPressed('true'), true);
+  assert.equal(utils.isCaptionButtonPressed('false'), false);
+  assert.match(
+    stylesSource,
+    /\.ytpm-overlay__captions-button\[aria-pressed="true"\]::after/
+  );
+  assert.match(
+    stylesSource,
+    /\.ytpm-overlay__captions-button\[aria-pressed="false"\]::after/
+  );
+});
+
+test('rejects stale storyboard loads and mismatched displayed sprites', () => {
+  const urls = {
+    m0: 'https://i.ytimg.com/sb/video/storyboard3_L2/M0.jpg',
+    m1: 'https://i.ytimg.com/sb/video/storyboard3_L2/M1.jpg',
+    m4: 'https://i.ytimg.com/sb/video/storyboard3_L2/M4.jpg',
+    m5: 'https://i.ytimg.com/sb/video/storyboard3_L2/M5.jpg'
+  };
+  const state = {
+    active: true,
+    hovering: true,
+    token: 0,
+    desiredUrl: '',
+    displayedUrl: ''
+  };
+  const visible = [];
+  const request = function (url, token) {
+    state.token = token;
+    state.desiredUrl = url;
+    return function resolve() {
+      if (utils.canApplyStoryboardFrame(state, token, url)) {
+        visible.push(url);
+      }
+    };
+  };
+
+  const resolveM0 = request(urls.m0, 1);
+  const resolveM5 = request(urls.m5, 2);
+  const resolveM1 = request(urls.m1, 3);
+  resolveM5();
+  resolveM0();
+  state.displayedUrl = urls.m1;
+  resolveM1();
+
+  const resolveM4 = request(urls.m4, 4);
+  state.displayedUrl = urls.m4;
+  resolveM4();
+  assert.deepEqual(visible, [urls.m1, urls.m4]);
+});
+
+test('requires a cache-hit sprite to become the displayed source before cropping', () => {
+  const state = {
+    active: true,
+    hovering: true,
+    token: 1,
+    desiredUrl: 'M0',
+    displayedUrl: 'M0'
+  };
+
+  assert.equal(utils.canApplyStoryboardFrame(state, 1, 'M0'), true);
+
+  state.token = 2;
+  state.desiredUrl = 'M5';
+  assert.equal(utils.canApplyStoryboardFrame(state, 2, 'M5'), false);
+  state.displayedUrl = 'M5';
+  assert.equal(utils.canApplyStoryboardFrame(state, 2, 'M5'), true);
+
+  state.token = 3;
+  state.desiredUrl = 'M0';
+  assert.equal(utils.canApplyStoryboardFrame(state, 3, 'M0'), false);
+  state.displayedUrl = 'M0';
+  assert.equal(utils.canApplyStoryboardFrame(state, 3, 'M0'), true);
+});
+
+test('maps realistic storyboard specs across first, middle, and last sprite cells', () => {
   const catalog = utils.buildCaptionCatalog({
-    videoDetails: { videoId: 'dQw4w9WgXcQ' },
+    videoDetails: { videoId: 'dQw4w9WgXcQ', lengthSeconds: '205' },
     storyboards: {
       playerStoryboardSpecRenderer: {
-        spec: 'https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L$L/$N.jpg|' +
-          '160#90#100#10#10#10000#default#M0'
+        spec: 'https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L$L/$N.jpg?sqp=test-sqp|' +
+          '160#90#100#10#10#0#default#sig-low|' +
+          '320#180#205#5#5#10000#M$M#sig-high',
+        recommendedLevel: 1
       }
     }
   }, 'https://www.youtube.com', 'dQw4w9WgXcQ');
 
   assert.equal(catalog.videoId, 'dQw4w9WgXcQ');
-  assert.equal(catalog.storyboard.formats[0].intervalMs, 10000);
-  const frame = utils.getStoryboardFrame(catalog.storyboard, 55, 1000);
-  assert.equal(frame.url, 'https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L0/0.jpg');
-  assert.equal(frame.x, 5 * 160);
-  assert.equal(frame.y, 0);
+  assert.equal(catalog.storyboard.duration, 205);
+  assert.equal(catalog.storyboard.formats[1].sourceInterval, 10000);
+  assert.equal(catalog.storyboard.formats[1].framesPerSprite, 25);
+  assert.equal(catalog.storyboard.formats[1].name, 'M$M');
+  assert.equal(catalog.storyboard.formats[1].signature, 'sig-high');
+
+  const lowLevelStoryboard = { ...catalog.storyboard, recommendedLevel: 0 };
+  const lowFrame = utils.getStoryboardFrame(lowLevelStoryboard, 100, 205);
+  assert.equal(
+    lowFrame.url,
+    'https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L0/default.jpg?sqp=test-sqp&sigh=sig-low'
+  );
+
+  const first = utils.getStoryboardFrame(catalog.storyboard, 0, 205);
+  assert.equal(
+    first.url,
+    'https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L1/M0.jpg?sqp=test-sqp&sigh=sig-high'
+  );
+  assert.deepEqual({ frameIndex: first.frameIndex, spriteIndex: first.spriteIndex, cellIndex: first.cellIndex }, {
+    frameIndex: 0,
+    spriteIndex: 0,
+    cellIndex: 0
+  });
+
+  const secondSprite = utils.getStoryboardFrame(catalog.storyboard, 26, 205);
+  assert.deepEqual({
+    frameIndex: secondSprite.frameIndex,
+    spriteIndex: secondSprite.spriteIndex,
+    cellIndex: secondSprite.cellIndex,
+    x: secondSprite.x,
+    y: secondSprite.y
+  }, {
+    frameIndex: 26,
+    spriteIndex: 1,
+    cellIndex: 1,
+    x: 320,
+    y: 0
+  });
+
+  const middle = utils.getStoryboardFrame(catalog.storyboard, 126, 205);
+  assert.deepEqual({ frameIndex: middle.frameIndex, spriteIndex: middle.spriteIndex, cellIndex: middle.cellIndex }, {
+    frameIndex: 126,
+    spriteIndex: 5,
+    cellIndex: 1
+  });
+  assert.equal(middle.x, 320);
+  assert.equal(middle.y, 0);
+
+  const last = utils.getStoryboardFrame(catalog.storyboard, 204.9, 205);
+  assert.deepEqual({ frameIndex: last.frameIndex, spriteIndex: last.spriteIndex, cellIndex: last.cellIndex }, {
+    frameIndex: 204,
+    spriteIndex: 8,
+    cellIndex: 4
+  });
+  assert.equal(last.x, 4 * 320);
+  assert.equal(last.y, 0);
+
+  const midpoint = utils.getStoryboardFrame(catalog.storyboard, 205 / 2, 205);
+  assert.equal(midpoint.frameIndex, 102);
+  assert.ok(midpoint.frameIndex >= 0 && midpoint.frameIndex < 205);
+
+  const exactEnd = utils.getStoryboardFrame(catalog.storyboard, 205, 205);
+  assert.equal(exactEnd.frameIndex, 204);
+  assert.equal(exactEnd.framesPerSprite, 25);
+  assert.equal(exactEnd.spriteIndex, 8);
+  assert.equal(exactEnd.cellIndex, 4);
+  assert.ok(exactEnd.frameIndex >= 0 && exactEnd.frameIndex < 205);
+
+  const pastEnd = utils.getStoryboardFrame(catalog.storyboard, 999, 205);
+  assert.equal(pastEnd.frameIndex, 204);
+  assert.equal(pastEnd.spriteIndex, 8);
+  assert.equal(pastEnd.cellIndex, 4);
+
+  const negative = utils.getStoryboardFrame(catalog.storyboard, -10, 205);
+  assert.equal(negative.frameIndex, 0);
+  assert.equal(negative.spriteIndex, 0);
+  assert.equal(negative.cellIndex, 0);
+
+  const notANumber = utils.getStoryboardFrame(catalog.storyboard, Number.NaN, 205);
+  assert.equal(notANumber.frameIndex, 0);
+  assert.equal(
+    utils.getStoryboardFrame({ ...catalog.storyboard, duration: 0 }, 0, 0),
+    null
+  );
 });
 
-test('preserves sparse storyboard levels when the recommended level skips an invalid format', () => {
+test('preserves sparse storyboard levels when the recommended level skips malformed data', () => {
   const catalog = utils.buildCaptionCatalog({
-    videoDetails: { videoId: 'dQw4w9WgXcQ' },
+    videoDetails: { videoId: 'dQw4w9WgXcQ', lengthSeconds: '213' },
     storyboards: {
       playerStoryboardSpecRenderer: {
         spec: 'https://i.ytimg.com/sb/dQw4w9WgXcQ/storyboard3_L$L/$N.jpg|' +
-          '48#27#100#10#10#0#default#sig0|' +
-          '80#45#108#10#10#2000#M$M#sig1|' +
-          '160#90#108#5#5#2000#M$M#sig2|' +
-          '320#180#108#3#3#2000#M$M#sig3',
+          'not-a-storyboard-format|' +
+          '80#45#213#10#10#10000#M$M#sig1|' +
+          '160#90#213#5#5#10000#M$M#sig2|' +
+          '320#180#213#3#3#10000#M$M#sig3',
         recommendedLevel: 3
       }
     }
@@ -123,7 +373,7 @@ test('preserves sparse storyboard levels when the recommended level skips an inv
     '1,2,3'
   );
   assert.equal(
-    utils.getStoryboardFrame(catalog.storyboard, 60, 213).url.includes('/storyboard3_L3/'),
+    utils.getStoryboardFrame(catalog.storyboard, 60, 213).url.includes('/storyboard3_L3/M6.jpg'),
     true
   );
 });
@@ -165,6 +415,14 @@ test('sanitizes live caption catalogs and rejects unsafe storyboard origins', ()
   assert.equal(catalog.tracks.length, 1);
   assert.equal(catalog.translationLanguages[0].languageCode, 'ar');
   assert.equal(catalog.storyboard, null);
+  assert.equal(
+    utils.normalizeStoryboard({ spec: 'not-a-valid-spec' }, 'dQw4w9WgXcQ', 10),
+    null
+  );
+  assert.equal(
+    utils.getStoryboardFrame({ formats: [] }, 1, 10),
+    null
+  );
 });
 
 test('parses JSON caption cues with a hard item limit', () => {

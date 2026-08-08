@@ -9,17 +9,23 @@
     'caption-catalog',
     'fetch-captions',
     'captions-info',
-    'toggle-captions'
+    'set-captions-enabled',
+    'seek-preview'
   ]);
   const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
-  const VIDEO_PLAYER_SELECTOR = [
-    'ytd-video-preview[active] .html5-video-player',
+  const PREVIEW_SELECTOR = 'ytd-video-preview';
+  const PREVIEW_PLAYER_SELECTOR = [
     '#inline-preview-player',
     '.html5-video-player',
-    'ytd-player'
+    'ytd-player#inline-player'
   ].join(', ');
   const MAX_CAPTION_RESPONSE_BYTES = 1024 * 1024;
   const CAPTION_REQUEST_TIMEOUT_MS = 4500;
+  const CAPTION_STATE_TIMEOUT_MS = 450;
+  const CAPTION_STATE_POLL_MS = 50;
+  const MAX_SEEK_SECONDS = 86400;
+  const DEBUG_LOGGING = false;
+  const captionTrackMemory = new WeakMap();
 
   const currentScript = document.currentScript;
   const BRIDGE_NONCE = currentScript && currentScript.dataset
@@ -28,6 +34,15 @@
 
   if (!BRIDGE_NONCE) {
     return;
+  }
+
+  function debugLog(scope, message, details) {
+    if (!DEBUG_LOGGING || typeof console === 'undefined' ||
+      typeof console.debug !== 'function') {
+      return;
+    }
+
+    console.debug('[YTPM][' + scope + ']', message, details || {});
   }
 
   function isRequest(data) {
@@ -74,27 +89,15 @@
       typeof candidate.getOption === 'function' ||
       typeof candidate.setOption === 'function' ||
       typeof candidate.getPlayerResponse === 'function' ||
-      typeof candidate.getPlayerResponseData === 'function') {
+      typeof candidate.getPlayerResponseData === 'function' ||
+      typeof candidate.seekTo === 'function' ||
+      typeof candidate.getCurrentTime === 'function') {
       return candidate;
     }
 
     const nestedPlayer = candidate.querySelector &&
       candidate.querySelector('.html5-video-player');
     return nestedPlayer || null;
-  }
-
-  function getPlayerCandidates() {
-    const seen = new Set();
-    const candidates = [];
-
-    document.querySelectorAll(VIDEO_PLAYER_SELECTOR).forEach(function (candidate) {
-      if (!seen.has(candidate)) {
-        seen.add(candidate);
-        candidates.push(candidate);
-      }
-    });
-
-    return candidates;
   }
 
   function normalizeVideoId(value) {
@@ -104,19 +107,153 @@
     return VIDEO_ID_PATTERN.test(normalized) ? normalized : '';
   }
 
-  function findPlayer(videoId) {
+  function getVideoIdFromUrl(value) {
+    if (typeof value !== 'string' || !value) {
+      return '';
+    }
+
+    try {
+      const url = new URL(value, window.location.href);
+      const watchId = normalizeVideoId(url.searchParams.get('v'));
+      if (watchId) {
+        return watchId;
+      }
+
+      const match = url.pathname.match(/^\/(?:shorts|live)\/([^/]+)/);
+      return match ? normalizeVideoId(match[1]) : '';
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function getPreviewVideoId(preview) {
+    if (!preview || typeof preview.querySelectorAll !== 'function') {
+      return '';
+    }
+
+    const links = preview.querySelectorAll(
+      '#media-container-link[href], a[href*="/watch"], a[href*="/shorts/"], a[href*="/live/"]'
+    );
+    for (const link of links) {
+      const videoId = getVideoIdFromUrl(link.href || link.getAttribute('href'));
+      if (videoId) {
+        return videoId;
+      }
+    }
+
+    const players = preview.querySelectorAll(PREVIEW_PLAYER_SELECTOR);
+    for (const player of players) {
+      const data = getVideoData(player) || getVideoData(getApiPlayer(player));
+      const videoId = normalizeVideoId(data && data.video_id);
+      if (videoId) {
+        return videoId;
+      }
+    }
+
+    return '';
+  }
+
+  function getPreviewContext(videoId) {
     const normalizedVideoId = normalizeVideoId(videoId);
-    if (!normalizedVideoId) {
+    const previews = Array.from(document.querySelectorAll(PREVIEW_SELECTOR));
+    const activePreviews = previews.filter(function (preview) {
+      return preview.hasAttribute('active');
+    });
+    const matchingPreviews = normalizedVideoId
+      ? previews.filter(function (preview) {
+        return getPreviewVideoId(preview) === normalizedVideoId;
+      })
+      : [];
+    const preview = matchingPreviews.find(function (candidate) {
+      return candidate.hasAttribute('active');
+    }) || matchingPreviews[0] || (
+      activePreviews.length === 1 &&
+      (!normalizedVideoId || !getPreviewVideoId(activePreviews[0]))
+        ? activePreviews[0]
+        : null
+    );
+
+    if (!preview) {
       return null;
     }
 
-    const matchingCandidate = getPlayerCandidates().find(function (candidate) {
-      const data = getVideoData(candidate) ||
-        getVideoData(getApiPlayer(candidate));
-      return data && data.video_id === normalizedVideoId;
-    });
+    const player = preview.querySelector(PREVIEW_PLAYER_SELECTOR) || preview;
+    return {
+      preview: preview,
+      player: getApiPlayer(player) || player
+    };
+  }
 
-    return matchingCandidate ? getApiPlayer(matchingCandidate) : null;
+  function readPlayerCurrentTime(player) {
+    if (!player || typeof player.getCurrentTime !== 'function') {
+      return null;
+    }
+
+    try {
+      const value = Number(player.getCurrentTime());
+      return Number.isFinite(value) && value >= 0 && value <= MAX_SEEK_SECONDS
+        ? value
+        : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function seekPreview(player, context, seconds, allowSeekAhead) {
+    const targetTime = Math.max(0, Math.min(MAX_SEEK_SECONDS, Number(seconds)));
+    const playerFound = Boolean(context && player);
+    const before = readPlayerCurrentTime(player);
+    if (!playerFound || typeof player.seekTo !== 'function') {
+      return {
+        ok: false,
+        available: playerFound,
+        playerFound: playerFound,
+        seekToAvailable: false,
+        targetTime: targetTime,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: before
+      };
+    }
+
+    try {
+      player.seekTo(targetTime, allowSeekAhead === true);
+      const after = readPlayerCurrentTime(player);
+      debugLog('Seek', 'player seekTo', {
+        requestedTime: targetTime,
+        playerFound: true,
+        playerSeekToAvailable: true,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: after,
+        allowSeekAhead: allowSeekAhead === true
+      });
+      return {
+        ok: true,
+        available: true,
+        playerFound: true,
+        seekToAvailable: true,
+        targetTime: targetTime,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: after
+      };
+    } catch (error) {
+      debugLog('Seek', 'player seekTo failed', {
+        requestedTime: targetTime,
+        playerFound: true,
+        playerSeekToAvailable: true,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: readPlayerCurrentTime(player),
+        allowSeekAhead: allowSeekAhead === true
+      });
+      return {
+        ok: false,
+        available: true,
+        playerFound: true,
+        seekToAvailable: true,
+        targetTime: targetTime,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: readPlayerCurrentTime(player)
+      };
+    }
   }
 
   function getPlayerResponse(player) {
@@ -619,16 +756,135 @@
     return [];
   }
 
-  function findCaptionControl(player) {
-    if (!player || typeof player.querySelector !== 'function') {
-      return null;
+  function isVisibleNode(node) {
+    if (!node || !node.isConnected) {
+      return false;
     }
 
-    return player.querySelector(
-      '.ytp-subtitles-button, ' +
-      '.ytp-button[aria-label*="caption" i], ' +
-      '.ytp-button[aria-label*="subtitle" i]'
-    );
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      rect.width > 0 && rect.height > 0;
+  }
+
+  function getCaptionControlCandidates(context) {
+    const roots = [];
+    if (context && context.preview) {
+      roots.push(context.preview);
+    }
+    if (context && context.player && !roots.includes(context.player)) {
+      roots.push(context.player);
+    }
+    if (!roots.length && context && typeof context.querySelectorAll === 'function') {
+      roots.push(context);
+    }
+
+    const selectors = [
+      '.ytmClosedCaptioningButtonButton',
+      '.ytp-subtitles-button',
+      '[role="button"][aria-label*="caption" i]',
+      '[role="button"][aria-label*="subtitle" i]',
+      'button[aria-label*="caption" i]',
+      'button[aria-label*="subtitle" i]'
+    ];
+    const seen = new Set();
+    const candidates = [];
+
+    roots.forEach(function (root) {
+      selectors.forEach(function (selector) {
+        root.querySelectorAll(selector).forEach(function (candidate) {
+          if (!seen.has(candidate)) {
+            seen.add(candidate);
+            candidates.push(candidate);
+          }
+        });
+      });
+    });
+
+    return candidates;
+  }
+
+  function findCaptionControl(context) {
+    const candidates = getCaptionControlCandidates(context);
+    return candidates.find(isVisibleNode) || candidates[0] || null;
+  }
+
+  function findCaptionRenderer(context) {
+    const roots = [];
+    if (context && context.player) {
+      roots.push(context.player);
+    }
+    if (context && context.preview && !roots.includes(context.preview)) {
+      roots.push(context.preview);
+    }
+
+    for (const root of roots) {
+      const renderer = root.querySelector(
+        '.ytp-caption-window-container, ' +
+        '#ytp-caption-window-container, ' +
+        '[class*="caption-window" i]'
+      );
+      if (renderer) {
+        return renderer;
+      }
+    }
+
+    return null;
+  }
+
+  function readVisibleCaptionText(renderer) {
+    if (!renderer || !renderer.isConnected) {
+      return '';
+    }
+
+    const captionWindows = Array.from(renderer.querySelectorAll('.caption-window'))
+      .filter(isVisibleNode);
+    if (!captionWindows.length && !isVisibleNode(renderer)) {
+      return '';
+    }
+    const roots = captionWindows.length ? captionWindows : [renderer];
+    const seenSegments = new Set();
+    const segmentText = [];
+    roots.forEach(function (root) {
+      const candidates = [];
+      if (root.matches && root.matches('.ytp-caption-segment, [class*="caption-segment" i]')) {
+        candidates.push(root);
+      }
+      candidates.push.apply(candidates, root.querySelectorAll(
+        '.ytp-caption-segment, [class*="caption-segment" i]'
+      ));
+      candidates.forEach(function (segment) {
+        if (seenSegments.has(segment) || !isVisibleNode(segment)) {
+          return;
+        }
+        seenSegments.add(segment);
+        const text = String(segment.textContent || '').replace(/[ \t]+/g, ' ').trim();
+        if (text) {
+          segmentText.push(text);
+        }
+      });
+    });
+    const text = segmentText.length
+      ? segmentText.join('\n')
+      : roots.filter(isVisibleNode).map(function (root) {
+        return String(root.innerText || root.textContent || '');
+      }).join('\n');
+
+    return text.replace(/\r\n?/g, '\n').split('\n').map(function (line) {
+      return line.replace(/[ \t]+/g, ' ').trim();
+    }).filter(function (line, index, lines) {
+      return line && (index === 0 || line !== lines[index - 1]);
+    }).join('\n').slice(0, 8192);
+  }
+
+  function resolveCaptionEnabledState(controlState, hasShowingTextTrack, hasVisibleRendererText) {
+    if (controlState === true) {
+      return true;
+    }
+    if (controlState === false) {
+      return false;
+    }
+    return Boolean(hasShowingTextTrack || hasVisibleRendererText);
   }
 
   function findPlayerVideos(player) {
@@ -670,9 +926,9 @@
     });
   }
 
-  function isCaptionControlEnabled(button) {
+  function getCaptionControlState(button) {
     if (!button) {
-      return false;
+      return null;
     }
 
     if (button.getAttribute('aria-pressed') === 'true' ||
@@ -680,14 +936,34 @@
       return true;
     }
 
-    const label = button.getAttribute('aria-label') || '';
-    return /turn off|disable|hide/i.test(label);
+    if (button.getAttribute('aria-pressed') === 'false') {
+      return false;
+    }
+
+    const label = [
+      button.getAttribute('aria-label') || '',
+      button.getAttribute('title') || ''
+    ].join(' ');
+    if (/turned off|turn on|enable|show/i.test(label)) {
+      return false;
+    }
+    if (/turned on|turn off|disable|hide/i.test(label)) {
+      return true;
+    }
+    return null;
   }
 
-  function getCaptionInfo(player) {
-    const button = findCaptionControl(player);
+  function getCaptionInfo(player, context) {
+    const button = findCaptionControl(context || player);
     const trackList = getCaptionTrackList(player);
     const selectedTrack = getOption(player, 'captions', 'track');
+    const controlState = getCaptionControlState(button);
+    const rendererText = readVisibleCaptionText(findCaptionRenderer(context || player));
+    const safeSelectedTrack = safeTrackValue(selectedTrack);
+    if (player && (typeof player === 'object' || typeof player === 'function') &&
+      safeSelectedTrack) {
+      captionTrackMemory.set(player, safeSelectedTrack);
+    }
     const available = Boolean(
       button ||
       trackList.length ||
@@ -698,9 +974,12 @@
 
     return {
       available: available,
-      enabled: hasShowingTextTrack(player) ||
-        isCaptionControlEnabled(button) ||
-        Boolean(selectedTrack && (selectedTrack.languageCode || selectedTrack.vssId))
+      enabled: resolveCaptionEnabledState(
+        controlState,
+        hasShowingTextTrack(player),
+        Boolean(rendererText)
+      ),
+      buttonState: controlState
     };
   }
 
@@ -718,32 +997,143 @@
     return Object.keys(value).length ? value : null;
   }
 
-  function toggleCaptions(player) {
-    if (!player || typeof player.setOption !== 'function') {
-      const info = getCaptionInfo(player);
-      return { ok: false, available: info.available, enabled: info.enabled };
+  async function waitForCaptionState(player, context, desiredEnabled) {
+    const deadline = Date.now() + CAPTION_STATE_TIMEOUT_MS;
+    let latest = getCaptionInfo(player, context);
+
+    while (Date.now() < deadline) {
+      if (latest.enabled === desiredEnabled) {
+        return latest;
+      }
+      await new Promise(function (resolve) {
+        window.setTimeout(resolve, CAPTION_STATE_POLL_MS);
+      });
+      latest = getCaptionInfo(player, context);
     }
 
-    const info = getCaptionInfo(player);
-    let value = null;
+    return latest;
+  }
 
-    if (!info.enabled) {
-      const selectedTrack = safeTrackValue(getOption(player, 'captions', 'track'));
-      const firstTrack = getCaptionTrackList(player)[0];
-      value = selectedTrack || safeTrackValue(firstTrack);
+  async function setCaptionsEnabled(player, context, desiredEnabled) {
+    const desired = desiredEnabled === true;
+    const info = getCaptionInfo(player, context);
+    if (!info.available) {
+      return { ok: false, available: false, enabled: false };
+    }
 
-      if (!value) {
-        return { ok: false, available: info.available, enabled: info.enabled };
+    if (info.enabled === desired) {
+      debugLog('Captions', 'desired state already active', {
+        desiredEnabled: desired,
+        nativeEnabledBefore: info.enabled,
+        nativeEnabledAfter: info.enabled,
+        nativeButtonClicked: false,
+        setOptionUsed: false
+      });
+      return {
+        ok: true,
+        available: true,
+        enabled: info.enabled,
+        buttonClicked: false,
+        setOptionUsed: false
+      };
+    }
+
+    const button = findCaptionControl(context);
+    if (button && typeof button.click === 'function') {
+      try {
+        button.click();
+        const updated = await waitForCaptionState(player, context, desired);
+        const result = {
+          ok: updated.enabled === desired,
+          available: updated.available,
+          enabled: updated.enabled,
+          buttonClicked: true,
+          setOptionUsed: false
+        };
+        debugLog('Captions', 'native button result', {
+          desiredEnabled: desired,
+          nativeEnabledBefore: info.enabled,
+          nativeEnabledAfter: updated.enabled,
+          nativeButtonClicked: true,
+          setOptionUsed: false,
+          ok: result.ok
+        });
+        return result;
+      } catch (error) {
+        const latest = getCaptionInfo(player, context);
+        debugLog('Captions', 'native button failed', {
+          desiredEnabled: desired,
+          nativeEnabledBefore: info.enabled,
+          nativeEnabledAfter: latest.enabled,
+          nativeButtonClicked: true,
+          setOptionUsed: false,
+          ok: false
+        });
+        return {
+          ok: false,
+          available: latest.available,
+          enabled: latest.enabled,
+          buttonClicked: true,
+          setOptionUsed: false
+        };
       }
     }
 
-    try {
-      player.setOption('captions', 'track', value || {});
-      const updated = getCaptionInfo(player);
-      return { ok: true, available: updated.available, enabled: updated.enabled };
-    } catch (error) {
-      return { ok: false, available: info.available, enabled: info.enabled };
+    if (player && typeof player.setOption === 'function') {
+      let value = null;
+      if (desired) {
+        const selectedTrack = safeTrackValue(getOption(player, 'captions', 'track')) ||
+          captionTrackMemory.get(player) ||
+          safeTrackValue(getCaptionTrackList(player)[0]);
+        value = selectedTrack;
+      }
+
+      try {
+        player.setOption('captions', 'track', value || {});
+        const apiUpdated = await waitForCaptionState(player, context, desired);
+        const result = {
+          ok: apiUpdated.enabled === desired,
+          available: apiUpdated.available,
+          enabled: apiUpdated.enabled,
+          buttonClicked: false,
+          setOptionUsed: true
+        };
+        debugLog('Captions', 'setOption result', {
+          desiredEnabled: desired,
+          nativeEnabledBefore: info.enabled,
+          nativeEnabledAfter: apiUpdated.enabled,
+          nativeButtonClicked: false,
+          setOptionUsed: true,
+          ok: result.ok
+        });
+        return result;
+      } catch (error) {
+        const latest = getCaptionInfo(player, context);
+        debugLog('Captions', 'setOption failed', {
+          desiredEnabled: desired,
+          nativeEnabledBefore: info.enabled,
+          nativeEnabledAfter: latest.enabled,
+          nativeButtonClicked: false,
+          setOptionUsed: true,
+          ok: false
+        });
+        return {
+          ok: false,
+          available: latest.available,
+          enabled: latest.enabled,
+          buttonClicked: false,
+          setOptionUsed: true
+        };
+      }
     }
+
+    return {
+      ok: false,
+      available: info.available,
+      enabled: info.enabled,
+      buttonClicked: false,
+      setOptionUsed: false
+    };
   }
 
   function handleRequest(command, payload) {
@@ -754,7 +1144,8 @@
     const data = payload && typeof payload === 'object' && !Array.isArray(payload)
       ? payload
       : {};
-    const player = findPlayer(data.videoId);
+    const context = getPreviewContext(data.videoId);
+    const player = context ? context.player : null;
 
     if (command === 'quality-info') {
       return getQualityInfo(player);
@@ -762,6 +1153,26 @@
 
     if (command === 'set-quality') {
       return setQuality(player, data.level);
+    }
+
+    if (command === 'seek-preview') {
+      const requestedVideoId = normalizeVideoId(data.videoId);
+      const seconds = Number(data.seconds);
+      if (
+        !requestedVideoId ||
+        !Number.isFinite(seconds) ||
+        seconds < 0 ||
+        seconds > MAX_SEEK_SECONDS ||
+        typeof data.allowSeekAhead !== 'boolean'
+      ) {
+        return {
+          ok: false,
+          available: false,
+          playerFound: false,
+          seekToAvailable: false
+        };
+      }
+      return seekPreview(player, context, seconds, data.allowSeekAhead);
     }
 
     if (command === 'caption-catalog') {
@@ -779,11 +1190,18 @@
     }
 
     if (command === 'captions-info') {
-      const info = getCaptionInfo(player);
+      const info = getCaptionInfo(player, context);
       return { ok: info.available, available: info.available, enabled: info.enabled };
     }
 
-    return toggleCaptions(player);
+    if (command === 'set-captions-enabled') {
+      if (typeof data.desiredEnabled !== 'boolean') {
+        return { ok: false, available: false, enabled: false };
+      }
+      return setCaptionsEnabled(player, context, data.desiredEnabled);
+    }
+
+    return { ok: false, available: false, enabled: false };
   }
 
   window.addEventListener('message', function (event) {

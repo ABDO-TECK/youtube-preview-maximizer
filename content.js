@@ -71,8 +71,15 @@
   const PAGE_BRIDGE_TIMEOUT_MS = 650;
   const CAPTION_SERVICE_SOURCE = 'ytpm-caption-service';
   const CAPTION_SERVICE_TIMEOUT_MS = 5000;
+  const NATIVE_CAPTION_REQUEST_TIMEOUT_MS = 1000;
+  const SEEK_CONFIRM_TIMEOUT_MS = 1200;
+  const SEEK_CONFIRM_POLL_MS = 80;
+  const SEEK_NOOP_EPSILON = 0.15;
+  const SEEK_CONFIRM_TOLERANCE = 0.5;
+  const SEEK_BUFFER_SAFETY_MARGIN = 0.05;
+  const SEEK_PRECISION_TIMEOUT_MS = 1800;
+  const SEEK_MAX_SECONDS = 86400;
   const CONTROLS_HIDE_DELAY_MS = 5000;
-  const TIMELINE_PREVIEW_CACHE_LIMIT = 24;
   const BRIDGE_ID_PATTERN = /^request-\d{1,12}$/;
   const DEBUG_LOGGING = false;
   const captionUtils = globalThis.YTPMCaptionUtils || {};
@@ -106,6 +113,30 @@
 
     const errorName = error && error.name ? error.name : 'UnknownError';
     console.debug('[YTPM]', operation, errorName);
+  }
+
+  function getDebugUrl(value) {
+    if (typeof value !== 'string' || !value) {
+      return '';
+    }
+
+    try {
+      const url = new URL(value, window.location.href);
+      url.search = '';
+      url.hash = '';
+      return url.href;
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function debugLog(scope, message, details) {
+    if (!DEBUG_LOGGING || typeof console === 'undefined' ||
+      typeof console.debug !== 'function') {
+      return;
+    }
+
+    console.debug('[YTPM][' + scope + ']', message, details || {});
   }
 
   function createBridgeNonce() {
@@ -160,10 +191,13 @@
       return null;
     }
 
+    const available = result.available === true;
     return {
       ok: result.ok === true,
-      available: result.available === true,
-      enabled: result.enabled === true
+      available: available,
+      enabled: available && result.enabled === true,
+      buttonClicked: result.buttonClicked === true,
+      setOptionUsed: result.setOptionUsed === true
     };
   }
 
@@ -224,6 +258,29 @@
     };
   }
 
+  function sanitizeSeekResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+      return null;
+    }
+
+    const sanitizeTime = function (value) {
+      const time = Number(value);
+      return Number.isFinite(time) && time >= 0 && time <= SEEK_MAX_SECONDS
+        ? time
+        : null;
+    };
+
+    return {
+      ok: result.ok === true,
+      available: result.available === true,
+      playerFound: result.playerFound === true,
+      seekToAvailable: result.seekToAvailable === true,
+      targetTime: sanitizeTime(result.targetTime),
+      playerCurrentTimeBefore: sanitizeTime(result.playerCurrentTimeBefore),
+      playerCurrentTimeAfter: sanitizeTime(result.playerCurrentTimeAfter)
+    };
+  }
+
   function sanitizeBridgeResult(command, result, request) {
     if (command === 'quality-info' || command === 'set-quality') {
       return sanitizeQualityResult(result);
@@ -237,8 +294,12 @@
       return sanitizeCaptionFetchResult(result);
     }
 
-    if (command === 'captions-info' || command === 'toggle-captions') {
+    if (command === 'captions-info' || command === 'set-captions-enabled') {
       return sanitizeCaptionResult(result);
+    }
+
+    if (command === 'seek-preview') {
+      return sanitizeSeekResult(result);
     }
 
     return null;
@@ -344,7 +405,8 @@
       'caption-catalog',
       'fetch-captions',
       'captions-info',
-      'toggle-captions'
+      'set-captions-enabled',
+      'seek-preview'
     ].includes(command)) {
       return Promise.resolve(null);
     }
@@ -1432,7 +1494,7 @@
 
     const captionsButton = document.createElement('button');
     captionsButton.type = 'button';
-    captionsButton.className = CONTROL_BUTTON_CLASS;
+    captionsButton.className = CONTROL_BUTTON_CLASS + ' ytpm-overlay__captions-button';
     captionsButton.setAttribute('aria-label', 'Turn captions on');
     captionsButton.title = 'Turn captions on';
     captionsButton.setAttribute('aria-pressed', 'false');
@@ -1469,6 +1531,13 @@
     timelineTime.textContent = '0:00';
     timelinePreview.appendChild(timelineImage);
     timelinePreview.appendChild(timelineTime);
+
+    const captions = document.createElement('div');
+    captions.className = 'ytpm-overlay__captions';
+    captions.setAttribute('role', 'status');
+    captions.setAttribute('aria-live', 'polite');
+    captions.setAttribute('aria-atomic', 'true');
+    captions.hidden = true;
 
     const qualityWrap = document.createElement('span');
     qualityWrap.className = QUALITY_CLASS;
@@ -1508,6 +1577,7 @@
 
     overlay.appendChild(frame);
     frame.appendChild(closeButton);
+    frame.appendChild(captions);
     frame.appendChild(timelinePreview);
     frame.appendChild(seekInput);
     frame.appendChild(controls);
@@ -1526,6 +1596,7 @@
         volumeInput: volumeInput,
         seekInput: seekInput,
         timeLabel: timeLabel,
+        captions: captions,
         timelinePreview: timelinePreview,
         timelineImage: timelineImage,
         timelineTime: timelineTime,
@@ -1591,6 +1662,40 @@
     return minutes + ':' + remainingSeconds;
   }
 
+  function clampSeekTimeValue(value, duration) {
+    if (captionUtils.clampSeekTime) {
+      return captionUtils.clampSeekTime(value, duration);
+    }
+
+    const safeDuration = Number(duration);
+    const numericValue = Number(value);
+    if (!Number.isFinite(safeDuration) || safeDuration <= 0 ||
+      !Number.isFinite(numericValue)) {
+      return 0;
+    }
+
+    return Math.max(0, Math.min(safeDuration, numericValue));
+  }
+
+  function getSeekDisplayTimeValue(actualTime, state, duration) {
+    if (captionUtils.getSeekDisplayTime) {
+      return captionUtils.getSeekDisplayTime(
+        actualTime,
+        state.pendingSeekTime,
+        state.seekDragging,
+        state.seekPending,
+        duration
+      );
+    }
+
+    return clampSeekTimeValue(
+      state.seekDragging || state.seekPending
+        ? state.pendingSeekTime
+        : actualTime,
+      duration
+    );
+  }
+
   function getPreviewDuration(state) {
     const metadataDuration = Number(state.duration);
     if (Number.isFinite(metadataDuration) && metadataDuration > 0) {
@@ -1611,6 +1716,547 @@
     return Array.from(video.textTracks).filter(function (track) {
       return track.kind === 'captions' || track.kind === 'subtitles';
     });
+  }
+
+  function getNativePreview(state) {
+    const rememberedPreview = state.nativePreview;
+    if (rememberedPreview && rememberedPreview.isConnected &&
+      (!state.card || isPreviewAssociatedWithCard(state.card, rememberedPreview))) {
+      return rememberedPreview;
+    }
+
+    const discoveredPreview = state.card && findActivePreview(state.card);
+    if (discoveredPreview) {
+      state.nativePreview = discoveredPreview;
+      return discoveredPreview;
+    }
+
+    return null;
+  }
+
+  function getNativePreviewPlayer(preview) {
+    if (!preview || typeof preview.querySelectorAll !== 'function') {
+      return null;
+    }
+
+    const candidates = Array.from(preview.querySelectorAll(
+      '#inline-preview-player, ytd-player#inline-player, .html5-video-player'
+    ));
+    return candidates.find(function (candidate) {
+      return candidate.id === 'inline-preview-player' && isVisible(candidate);
+    }) || candidates.find(isVisible) || candidates[0] || null;
+  }
+
+  function getNativeCaptionControl(preview, player) {
+    const roots = [];
+    if (preview) {
+      roots.push(preview);
+    }
+    if (player && !roots.includes(player)) {
+      roots.push(player);
+    }
+
+    const selectors = [
+      '.ytmClosedCaptioningButtonButton',
+      '.ytp-subtitles-button',
+      '[role="button"][aria-label*="caption" i]',
+      '[role="button"][aria-label*="subtitle" i]',
+      'button[aria-label*="caption" i]',
+      'button[aria-label*="subtitle" i]'
+    ];
+    const seen = new Set();
+    const candidates = [];
+    roots.forEach(function (root) {
+      selectors.forEach(function (selector) {
+        root.querySelectorAll(selector).forEach(function (candidate) {
+          if (!seen.has(candidate)) {
+            seen.add(candidate);
+            candidates.push(candidate);
+          }
+        });
+      });
+    });
+
+    return candidates.find(isVisible) || candidates[0] || null;
+  }
+
+  function getNativeCaptionRenderer(preview, player) {
+    const roots = [];
+    if (player) {
+      roots.push(player);
+    }
+    if (preview && !roots.includes(preview)) {
+      roots.push(preview);
+    }
+
+    for (const root of roots) {
+      const renderer = root.querySelector(
+        '.ytp-caption-window-container, ' +
+        '#ytp-caption-window-container, ' +
+        '[class*="caption-window" i]'
+      );
+      if (renderer) {
+        return renderer;
+      }
+    }
+
+    return null;
+  }
+
+  function getNativeCaptionControlState(button) {
+    if (!button) {
+      return null;
+    }
+
+    if (button.getAttribute('aria-pressed') === 'true' ||
+      button.classList.contains('ytp-button-active')) {
+      return true;
+    }
+    if (button.getAttribute('aria-pressed') === 'false') {
+      return false;
+    }
+
+    const label = [
+      button.getAttribute('aria-label') || '',
+      button.getAttribute('title') || ''
+    ].join(' ');
+    if (/turned off|turn on|enable|show/i.test(label)) {
+      return false;
+    }
+    if (/turned on|turn off|disable|hide/i.test(label)) {
+      return true;
+    }
+    return null;
+  }
+
+  function isVisibleCaptionNode(node) {
+    if (!node || !node.isConnected || node.hidden ||
+      node.getAttribute('aria-hidden') === 'true') {
+      return false;
+    }
+
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' ||
+      Number(style.opacity) === 0) {
+      return false;
+    }
+
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function getCaptionWindows(renderer) {
+    if (!renderer || !renderer.isConnected ||
+      typeof renderer.querySelectorAll !== 'function') {
+      return [];
+    }
+
+    const windows = [];
+    if (renderer.matches && renderer.matches('.caption-window')) {
+      windows.push(renderer);
+    }
+    renderer.querySelectorAll('.caption-window').forEach(function (captionWindow) {
+      if (!windows.includes(captionWindow)) {
+        windows.push(captionWindow);
+      }
+    });
+    return windows;
+  }
+
+  function readCaptionWindowText(captionWindow) {
+    if (!isVisibleCaptionNode(captionWindow)) {
+      return '';
+    }
+
+    const segments = [];
+    const seenSegments = new Set();
+    const candidates = [];
+    if (captionWindow.matches && captionWindow.matches(
+      '.ytp-caption-segment, [class*="caption-segment" i]'
+    )) {
+      candidates.push(captionWindow);
+    }
+    candidates.push.apply(candidates, captionWindow.querySelectorAll(
+      '.ytp-caption-segment, [class*="caption-segment" i]'
+    ));
+    candidates.forEach(function (segment) {
+      if (!seenSegments.has(segment) && isVisibleCaptionNode(segment)) {
+        seenSegments.add(segment);
+        segments.push(segment);
+      }
+    });
+
+    const values = segments.length
+      ? segments.map(function (segment) {
+        return segment.textContent || '';
+      })
+      : [typeof captionWindow.innerText === 'string'
+        ? captionWindow.innerText
+        : captionWindow.textContent || ''];
+
+    if (captionUtils.normalizeCaptionLines) {
+      return captionUtils.normalizeCaptionLines(values).slice(0, 8192);
+    }
+
+    return values.map(function (value) {
+      return String(value || '').replace(/[ \t]+/g, ' ').trim();
+    }).filter(Boolean).join('\n').slice(0, 8192);
+  }
+
+  function readNativeCaptionText(state, renderer) {
+    if (!renderer || !renderer.isConnected) {
+      return '';
+    }
+
+    const captionWindows = getCaptionWindows(renderer);
+    const hasGeneration = Boolean(
+      state && state.captionActiveWindows && state.captionActiveWindows.size
+    );
+    const activeWindows = hasGeneration
+      ? Array.from(state.captionActiveWindows).filter(function (captionWindow) {
+        return captionWindows.includes(captionWindow);
+      })
+      : captionWindows.filter(isVisibleCaptionNode);
+
+    if (hasGeneration && !activeWindows.length) {
+      return '';
+    }
+    if (!activeWindows.length) {
+      if (captionWindows.length || !isVisible(renderer)) {
+        return '';
+      }
+      const rendererValue = typeof renderer.innerText === 'string'
+        ? renderer.innerText
+        : renderer.textContent || '';
+      return captionUtils.normalizeCaptionLines
+        ? captionUtils.normalizeCaptionLines([rendererValue]).slice(0, 8192)
+        : String(rendererValue).replace(/[ \t]+/g, ' ').trim().slice(0, 8192);
+    }
+
+    const values = activeWindows.map(readCaptionWindowText).filter(Boolean);
+    if (captionUtils.normalizeCaptionLines) {
+      return captionUtils.normalizeCaptionLines(values).slice(0, 8192);
+    }
+
+    return values.join('\n').slice(0, 8192);
+  }
+
+  function readNativeCaptionState(state) {
+    const preview = getNativePreview(state);
+    const player = getNativePreviewPlayer(preview);
+    const button = getNativeCaptionControl(preview, player);
+    const renderer = getNativeCaptionRenderer(preview, player);
+    const controlState = getNativeCaptionControlState(button);
+    const text = readNativeCaptionText(state, renderer);
+    const tracks = getCaptionTracks(state.video);
+    const syntheticTrack = state.captionTrackElement && state.captionTrackElement.track;
+    const nativeTracks = state.captionTrackElement
+      ? syntheticTrack
+        ? tracks.filter(function (track) {
+          return track !== syntheticTrack;
+        })
+        : []
+      : tracks;
+    const available = Boolean(
+      button ||
+      nativeTracks.length ||
+      state.playerApi && typeof state.playerApi.setOption === 'function'
+    );
+
+    return {
+      preview: preview,
+      player: player,
+      button: button,
+      renderer: renderer,
+      text: text,
+      available: available,
+      enabled: captionUtils.resolveCaptionEnabledState
+        ? captionUtils.resolveCaptionEnabledState(
+          controlState,
+          nativeTracks.some(function (track) {
+            return track.mode === 'showing';
+          }),
+          text.length > 0
+        )
+        : controlState === true ||
+          (controlState !== false && (
+            text.length > 0 ||
+            nativeTracks.some(function (track) {
+              return track.mode === 'showing';
+            })
+          ))
+    };
+  }
+
+  function scheduleNativeCaptionMirrorUpdate(state) {
+    if (activeOverlay !== state || state.nativeCaptionSyncTimer) {
+      return;
+    }
+
+    state.nativeCaptionSyncTimer = window.setTimeout(function () {
+      state.nativeCaptionSyncTimer = 0;
+      updateNativeCaptionMirror(state);
+    }, 0);
+  }
+
+  function collectCaptionWindowsFromNode(node, renderer, collection, allowDetached) {
+    if (!node) {
+      return;
+    }
+
+    const element = node.nodeType === 1 ? node : node.parentElement;
+    if (element) {
+      const owner = element.matches && element.matches('.caption-window')
+        ? element
+        : element.closest && element.closest('.caption-window');
+      if (owner && (allowDetached || renderer.contains(owner))) {
+        collection.add(owner);
+      }
+      if (element.querySelectorAll) {
+        element.querySelectorAll('.caption-window').forEach(function (captionWindow) {
+          if (allowDetached || renderer.contains(captionWindow)) {
+            collection.add(captionWindow);
+          }
+        });
+      }
+    }
+
+    if (node.querySelectorAll) {
+      node.querySelectorAll('.caption-window').forEach(function (captionWindow) {
+        if (allowDetached || renderer.contains(captionWindow)) {
+          collection.add(captionWindow);
+        }
+      });
+    }
+  }
+
+  function handleCaptionMutationBatch(state, renderer, mutations) {
+    if (activeOverlay !== state || state.nativeCaptionRenderer !== renderer) {
+      return;
+    }
+
+    const contentTouched = new Set();
+    const activationTouched = new Set();
+    const removedWindows = new Set();
+
+    mutations.forEach(function (mutation) {
+      if (mutation.type === 'childList') {
+        collectCaptionWindowsFromNode(mutation.target, renderer, contentTouched, false);
+        Array.from(mutation.addedNodes || []).forEach(function (node) {
+          collectCaptionWindowsFromNode(node, renderer, contentTouched, false);
+        });
+        Array.from(mutation.removedNodes || []).forEach(function (node) {
+          collectCaptionWindowsFromNode(node, renderer, removedWindows, true);
+        });
+        return;
+      }
+
+      if (mutation.type === 'characterData') {
+        collectCaptionWindowsFromNode(mutation.target, renderer, contentTouched, false);
+        return;
+      }
+
+      if (mutation.type === 'attributes' && mutation.attributeName === 'aria-hidden') {
+        collectCaptionWindowsFromNode(mutation.target, renderer, activationTouched, false);
+      }
+    });
+
+    const currentWindows = getCaptionWindows(renderer);
+    const previousActiveWindows = Array.from(state.captionActiveWindows || [])
+      .filter(function (captionWindow) {
+        return currentWindows.includes(captionWindow) && !removedWindows.has(captionWindow);
+      });
+    const touchedWindows = contentTouched.size
+      ? Array.from(contentTouched)
+      : previousActiveWindows.length
+        ? previousActiveWindows
+        : Array.from(activationTouched);
+    const activeWindows = captionUtils.selectCaptionWindowGeneration
+      ? captionUtils.selectCaptionWindowGeneration(
+        previousActiveWindows,
+        touchedWindows,
+        currentWindows
+      )
+      : touchedWindows.filter(function (captionWindow) {
+        return currentWindows.includes(captionWindow);
+      });
+
+    state.captionGeneration += 1;
+    state.captionActiveWindows = new Set(activeWindows);
+    activeWindows.forEach(function (captionWindow) {
+      state.captionWindowGenerations.set(captionWindow, state.captionGeneration);
+    });
+
+    const windowDebug = currentWindows.map(function (captionWindow, index) {
+      const computedStyle = window.getComputedStyle(captionWindow);
+      return {
+        windowIndex: index,
+        windowText: readCaptionWindowText(captionWindow),
+        visible: isVisibleCaptionNode(captionWindow),
+        opacity: computedStyle.opacity,
+        ariaHidden: captionWindow.getAttribute('aria-hidden') || '',
+        isActiveGeneration: state.captionActiveWindows.has(captionWindow),
+        generation: state.captionWindowGenerations.get(captionWindow) || 0
+      };
+    });
+    const batchDebug = {
+      generation: state.captionGeneration,
+      mutationCount: mutations.length,
+      touchedWindows: touchedWindows.map(function (captionWindow) {
+        return currentWindows.indexOf(captionWindow);
+      }).filter(function (index) {
+        return index >= 0;
+      }),
+      activeWindows: activeWindows.map(function (captionWindow) {
+        return currentWindows.indexOf(captionWindow);
+      }).filter(function (index) {
+        return index >= 0;
+      }),
+      windowDebug: windowDebug,
+      finalMirroredLines: 0
+    };
+    state.captionLastMutationDebug = batchDebug;
+    debugLog('Captions', 'mutationBatch', batchDebug);
+  }
+
+  function connectNativeCaptionObservers(state, info) {
+    if (state.nativeCaptionRenderer !== info.renderer) {
+      if (state.nativeCaptionObserver) {
+        state.nativeCaptionObserver.disconnect();
+        state.nativeCaptionObserver = null;
+      }
+      state.nativeCaptionRenderer = info.renderer || null;
+      state.captionGeneration = 0;
+      state.captionActiveWindows = new Set();
+      state.captionWindowGenerations = new Map();
+      state.captionLastMutationDebug = null;
+
+      if (info.renderer && typeof MutationObserver === 'function') {
+        state.nativeCaptionObserver = new MutationObserver(function (mutations) {
+          handleCaptionMutationBatch(state, info.renderer, mutations);
+          debugLog('Captions', 'captionMutation', {
+            videoId: state.videoId,
+            generation: state.captionGeneration,
+            mutationCount: mutations.length,
+            playerFound: Boolean(info.player),
+            captionButtonFound: Boolean(info.button),
+            captionRendererFound: true,
+            captionEnabled: Boolean(state.nativeCaptionState && state.nativeCaptionState.enabled),
+            fallbackUsed: false
+          });
+          scheduleNativeCaptionMirrorUpdate(state);
+        });
+        state.nativeCaptionObserver.observe(info.renderer, {
+          subtree: true,
+          childList: true,
+          characterData: true,
+          attributes: true,
+          attributeFilter: ['class', 'style', 'aria-hidden']
+        });
+        debugLog('Captions', 'captionObserver', {
+          videoId: state.videoId,
+          playerFound: Boolean(info.player),
+          captionButtonFound: Boolean(info.button),
+          captionRendererFound: true,
+          observerActive: Boolean(state.nativeCaptionObserver),
+          fallbackUsed: false
+        });
+      }
+    }
+
+    if (state.nativePreviewObserved !== info.preview) {
+      if (state.nativePreviewObserver) {
+        state.nativePreviewObserver.disconnect();
+        state.nativePreviewObserver = null;
+      }
+      state.nativePreviewObserved = info.preview || null;
+
+      if (info.preview && typeof MutationObserver === 'function') {
+        state.nativePreviewObserver = new MutationObserver(function () {
+          scheduleNativeCaptionMirrorUpdate(state);
+        });
+        state.nativePreviewObserver.observe(info.preview, {
+          subtree: true,
+          childList: true
+        });
+      }
+    }
+  }
+
+  function updateNativeCaptionMirror(state) {
+    if (activeOverlay !== state || !state.elements || !state.controls.captions) {
+      return null;
+    }
+
+    const info = readNativeCaptionState(state);
+    connectNativeCaptionObservers(state, info);
+    state.nativeCaptionState = {
+      available: info.available,
+      enabled: info.enabled
+    };
+
+    if (info.available) {
+      state.captionInfo = {
+        available: true,
+        enabled: info.enabled
+      };
+      applyCaptionControl(state, state.captionInfo);
+    }
+
+    const text = info.enabled ? info.text : '';
+    const mirrorReplaced = state.nativeCaptionText !== text;
+    state.nativeCaptionText = text;
+    state.controls.captions.textContent = text;
+    state.controls.captions.hidden = !text;
+    if (state.captionLastMutationDebug) {
+      state.captionLastMutationDebug.finalMirroredLines = text
+        ? text.split('\n').length
+        : 0;
+      debugLog('Captions', 'mutationBatchFinal', state.captionLastMutationDebug);
+      state.captionLastMutationDebug = null;
+    }
+    debugLog('Captions', 'mirrorTextUpdated', {
+      videoId: state.videoId,
+      playerFound: Boolean(info.player),
+      captionButtonFound: Boolean(info.button),
+      captionRendererFound: Boolean(info.renderer),
+      captionEnabled: Boolean(info.enabled),
+      mirrorTextUpdated: Boolean(text),
+      mirrorReplaced: mirrorReplaced,
+      visibleLines: text ? text.split('\n').length : 0,
+      finalMirroredLines: text ? text.split('\n').length : 0,
+      generation: state.captionGeneration,
+      textLength: text.length,
+      fallbackUsed: false
+    });
+    return info;
+  }
+
+  function disposeNativeCaptionMirror(state) {
+    if (state.nativeCaptionObserver) {
+      state.nativeCaptionObserver.disconnect();
+      state.nativeCaptionObserver = null;
+    }
+    if (state.nativePreviewObserver) {
+      state.nativePreviewObserver.disconnect();
+      state.nativePreviewObserver = null;
+    }
+    if (state.nativeCaptionSyncTimer) {
+      window.clearTimeout(state.nativeCaptionSyncTimer);
+      state.nativeCaptionSyncTimer = 0;
+    }
+    state.nativeCaptionRenderer = null;
+    state.nativePreviewObserved = null;
+    state.nativeCaptionState = null;
+    state.nativeCaptionText = '';
+    state.captionGeneration = 0;
+    state.captionActiveWindows = new Set();
+    state.captionWindowGenerations = new Map();
+    state.captionLastMutationDebug = null;
+    if (state.controls && state.controls.captions) {
+      state.controls.captions.textContent = '';
+      state.controls.captions.hidden = true;
+    }
   }
 
   function formatCaptionTimestamp(seconds) {
@@ -1738,7 +2384,9 @@
       return typeof candidate.getAvailableQualityLevels === 'function' ||
         typeof candidate.setPlaybackQuality === 'function' ||
         typeof candidate.setPlaybackQualityRange === 'function' ||
-        typeof candidate.getVideoData === 'function';
+        typeof candidate.getVideoData === 'function' ||
+        typeof candidate.seekTo === 'function' ||
+        typeof candidate.getCurrentTime === 'function';
     }) || null;
   }
 
@@ -1796,10 +2444,13 @@
 
   function applyCaptionControl(state, info) {
     const available = info && info.available !== false;
-    const enabled = Boolean(info && info.enabled);
+    const pressedValue = String(Boolean(info && info.enabled));
+    const enabled = captionUtils.isCaptionButtonPressed
+      ? captionUtils.isCaptionButtonPressed(pressedValue)
+      : pressedValue === 'true';
 
     state.controls.captionsButton.disabled = !available;
-    state.controls.captionsButton.setAttribute('aria-pressed', String(enabled));
+    state.controls.captionsButton.setAttribute('aria-pressed', pressedValue);
     state.controls.captionsButton.setAttribute(
       'aria-label',
       enabled ? 'Turn captions off' : 'Turn captions on'
@@ -1810,6 +2461,11 @@
   }
 
   function updateCaptionControl(state) {
+    const nativeInfo = updateNativeCaptionMirror(state);
+    if (nativeInfo && nativeInfo.available) {
+      return;
+    }
+
     const tracks = getCaptionTracks(state.video);
     if (tracks.length) {
       const directInfo = {
@@ -1823,9 +2479,7 @@
       return;
     }
 
-    // Preview videos often expose zero textTracks in the isolated content-script world.
-    // The page bridge fills this state from YouTube's own player controls/API.
-    applyCaptionControl(state, state.captionInfo || { available: true, enabled: false });
+    applyCaptionControl(state, state.captionInfo || { available: false, enabled: false });
   }
 
   function hasCaptionTracks(catalog) {
@@ -1862,6 +2516,28 @@
       duration: duration,
       storyboard: first.storyboard || second.storyboard || null
     };
+  }
+
+  function debugStoryboardMetadata(state, storyboard) {
+    const format = storyboard && Array.isArray(storyboard.formats)
+      ? storyboard.formats.find(function (candidate) {
+        return candidate.level === storyboard.recommendedLevel;
+      }) || storyboard.formats[0]
+      : null;
+
+    debugLog('Storyboard', 'metadata', {
+      videoId: state.videoId,
+      duration: state.duration || (storyboard && storyboard.duration) || 0,
+      storyboardSpecFound: Boolean(storyboard),
+      storyboardLevel: format ? format.level : null,
+      frameCount: format ? format.count : 0,
+      columns: format ? format.columns : 0,
+      rows: format ? format.rows : 0,
+      framesPerSprite: format ? format.framesPerSprite : 0,
+      spriteCount: format ? format.spriteCount : 0,
+      storyboardUrl: format ? getDebugUrl(storyboard.template) : '',
+      templateUrl: format ? getDebugUrl(storyboard.template) : ''
+    });
   }
 
   async function requestCaptionCatalog(state) {
@@ -1907,6 +2583,7 @@
         state.captionCatalog = catalog;
         state.storyboard = catalog.storyboard || null;
         state.captionCatalogLoaded = true;
+        debugStoryboardMetadata(state, state.storyboard);
         scheduleVideoControlUpdate(state);
       }
 
@@ -1924,6 +2601,23 @@
   }
 
   function refreshCaptionControl(state) {
+    const nativeInfo = updateNativeCaptionMirror(state);
+    if (nativeInfo && nativeInfo.available) {
+      debugLog('Captions', 'native renderer state', {
+        videoId: state.videoId,
+        playerFound: Boolean(nativeInfo.player),
+        captionButtonFound: Boolean(nativeInfo.button),
+        setOptionAvailable: Boolean(state.playerApi &&
+          typeof state.playerApi.setOption === 'function'),
+        captionRendererFound: Boolean(nativeInfo.renderer),
+        captionState: nativeInfo.enabled ? 'enabled' : 'disabled',
+        captionEnabled: Boolean(nativeInfo.enabled),
+        fallbackUsed: false,
+        timedTextFallbackUsed: false
+      });
+      return;
+    }
+
     const tracks = getCaptionTracks(state.video);
     if (tracks.length) {
       updateCaptionControl(state);
@@ -1931,33 +2625,53 @@
     }
 
     const requestId = ++state.captionRequestId;
-    requestCaptionCatalog(state).then(function (catalog) {
-      if (activeOverlay !== state || requestId !== state.captionRequestId) {
-        return;
-      }
+    requestPageBridge('captions-info', { videoId: state.videoId }, NATIVE_CAPTION_REQUEST_TIMEOUT_MS)
+      .then(function (nativeBridgeInfo) {
+        if (activeOverlay !== state || requestId !== state.captionRequestId) {
+          return null;
+        }
 
-      if (hasCaptionTracks(catalog)) {
-        state.captionInfo = { available: true, enabled: false };
-        applyCaptionControl(state, state.captionInfo);
-        return;
-      }
+        if (nativeBridgeInfo && nativeBridgeInfo.available === true) {
+          state.captionInfo = {
+            available: true,
+            enabled: Boolean(nativeBridgeInfo.enabled)
+          };
+          applyCaptionControl(state, state.captionInfo);
+          const updatedNativeInfo = updateNativeCaptionMirror(state);
+          debugLog('Captions', 'page-native renderer state', {
+            videoId: state.videoId,
+            playerFound: Boolean(updatedNativeInfo && updatedNativeInfo.player),
+            captionButtonFound: Boolean(updatedNativeInfo && updatedNativeInfo.button),
+            setOptionAvailable: Boolean(state.playerApi &&
+              typeof state.playerApi.setOption === 'function'),
+            captionRendererFound: Boolean(updatedNativeInfo && updatedNativeInfo.renderer),
+            captionState: state.captionInfo.enabled ? 'enabled' : 'disabled',
+            captionEnabled: Boolean(state.captionInfo.enabled),
+            fallbackUsed: false,
+            timedTextFallbackUsed: false
+          });
+          return null;
+        }
 
-      return requestPageBridge('captions-info', { videoId: state.videoId }).then(function (info) {
+        return requestCaptionCatalog(state);
+      }).then(function (catalog) {
         if (activeOverlay !== state || requestId !== state.captionRequestId) {
           return;
         }
 
-        if (info && typeof info.available === 'boolean') {
-          state.captionInfo = {
-            available: info.available,
-            enabled: Boolean(info.enabled)
-          };
+        if (!catalog) {
+          state.captionInfo = { available: false, enabled: false };
+          applyCaptionControl(state, state.captionInfo);
+          return;
+        }
+
+        if (hasCaptionTracks(catalog)) {
+          state.captionInfo = { available: true, enabled: false };
           applyCaptionControl(state, state.captionInfo);
         }
+      }).catch(function (error) {
+        reportError('caption-control-refresh', error);
       });
-    }).catch(function (error) {
-      reportError('caption-control-refresh', error);
-    });
   }
 
   function chooseCaptionSelection(catalog) {
@@ -1995,25 +2709,90 @@
     };
   }
 
-  async function toggleCaptionsViaPlayerApi(state) {
-    const result = await requestPageBridge('toggle-captions', {
-      videoId: state.videoId
-    });
+  async function toggleNativeCaptions(state) {
+    const initial = updateNativeCaptionMirror(state);
+    let current = initial;
+
+    if (!current || !current.available) {
+      const bridgeInfo = await requestPageBridge(
+        'captions-info',
+        { videoId: state.videoId },
+        NATIVE_CAPTION_REQUEST_TIMEOUT_MS
+      );
+      if (activeOverlay !== state) {
+        return null;
+      }
+      if (bridgeInfo && bridgeInfo.available === true) {
+        current = {
+          available: true,
+          enabled: Boolean(bridgeInfo.enabled)
+        };
+      }
+    }
+
+    if (!current || !current.available) {
+      return null;
+    }
+
+    const desiredEnabled = !current.enabled;
+    const bridgeResult = await requestPageBridge(
+      'set-captions-enabled',
+      { videoId: state.videoId, desiredEnabled: desiredEnabled },
+      NATIVE_CAPTION_REQUEST_TIMEOUT_MS
+    );
 
     if (activeOverlay !== state) {
-      return false;
+      return null;
     }
 
-    if (result && result.ok) {
+    if (bridgeResult && bridgeResult.available === true) {
       state.captionInfo = {
-        available: result.available !== false,
-        enabled: Boolean(result.enabled)
+        available: true,
+        enabled: Boolean(bridgeResult.enabled)
       };
       applyCaptionControl(state, state.captionInfo);
-      return true;
+      const updatedNativeInfo = updateNativeCaptionMirror(state);
+      debugLog('Captions', 'native toggle result', {
+        videoId: state.videoId,
+        desiredEnabled: desiredEnabled,
+        nativeEnabledBefore: current.enabled,
+        nativeEnabledAfter: Boolean(bridgeResult.enabled),
+        nativeButtonClicked: bridgeResult.buttonClicked === true,
+        playerFound: Boolean(updatedNativeInfo && updatedNativeInfo.player),
+        captionButtonFound: Boolean(updatedNativeInfo && updatedNativeInfo.button),
+        setOptionAvailable: Boolean(state.playerApi &&
+          typeof state.playerApi.setOption === 'function'),
+        setOptionUsed: bridgeResult.setOptionUsed === true,
+        captionRendererFound: Boolean(updatedNativeInfo && updatedNativeInfo.renderer),
+        captionState: state.captionInfo.enabled ? 'enabled' : 'disabled',
+        captionEnabled: Boolean(state.captionInfo.enabled),
+        fallbackUsed: false,
+        timedTextFallbackUsed: false
+      });
+      return bridgeResult;
     }
 
-    return false;
+    state.captionInfo = {
+      available: true,
+      enabled: current.enabled
+    };
+    applyCaptionControl(state, state.captionInfo);
+    debugLog('Captions', 'native toggle failed', {
+      videoId: state.videoId,
+      desiredEnabled: desiredEnabled,
+      nativeEnabledBefore: current.enabled,
+      nativeEnabledAfter: current.enabled,
+      nativeButtonClicked: Boolean(bridgeResult && bridgeResult.buttonClicked),
+      setOptionUsed: Boolean(bridgeResult && bridgeResult.setOptionUsed),
+      fallbackUsed: false
+    });
+    return {
+      ok: false,
+      available: true,
+      enabled: current.enabled,
+      buttonClicked: Boolean(bridgeResult && bridgeResult.buttonClicked),
+      setOptionUsed: Boolean(bridgeResult && bridgeResult.setOptionUsed)
+    };
   }
 
   async function loadPreviewCaptions(state) {
@@ -2085,16 +2864,22 @@
         )) {
           state.captionInfo = { available: true, enabled: true };
           applyCaptionControl(state, state.captionInfo);
+          debugLog('Captions', 'timed-text fallback enabled', {
+            videoId: state.videoId,
+            fallbackUsed: true,
+            timedTextFallbackUsed: true
+          });
           return;
         }
       }
 
-      if (await toggleCaptionsViaPlayerApi(state)) {
-        return;
-      }
-
       state.captionInfo = { available: false, enabled: false };
       applyCaptionControl(state, state.captionInfo);
+      debugLog('Captions', 'timed-text fallback unavailable', {
+        videoId: state.videoId,
+        fallbackUsed: true,
+        timedTextFallbackUsed: true
+      });
       showPreviewNotice('YouTube did not provide captions for this preview.');
     } catch (error) {
       reportError('caption-load', error);
@@ -2195,6 +2980,7 @@
     const currentTime = Number.isFinite(video.currentTime) && video.currentTime >= 0
       ? video.currentTime
       : 0;
+    const displayTime = getSeekDisplayTimeValue(currentTime, state, duration);
     const isPlaying = !video.paused && !video.ended;
 
     const volume = Number.isFinite(video.volume) ? video.volume : 1;
@@ -2225,14 +3011,12 @@
 
     controls.seekInput.disabled = duration === 0;
     controls.seekInput.max = String(duration || 1);
-    if (document.activeElement !== controls.seekInput) {
-      controls.seekInput.value = String(Math.min(currentTime, duration || 1));
-    }
+    controls.seekInput.value = String(displayTime);
     controls.seekInput.style.setProperty(
       '--ytpm-seek-progress',
-      (duration ? Math.min(100, (currentTime / duration) * 100) : 0) + '%'
+      (duration ? Math.min(100, (displayTime / duration) * 100) : 0) + '%'
     );
-    controls.timeLabel.textContent = formatTime(currentTime) + ' / ' + formatTime(duration);
+    controls.timeLabel.textContent = formatTime(displayTime) + ' / ' + formatTime(duration);
 
     updateCaptionControl(state);
     updateFullscreenControl(state);
@@ -2266,30 +3050,67 @@
     };
   }
 
-  function rememberTimelineImage(state, url) {
-    state.timelineImageCache.delete(url);
-    state.timelineImageCache.set(url, true);
-    while (state.timelineImageCache.size > TIMELINE_PREVIEW_CACHE_LIMIT) {
-      state.timelineImageCache.delete(state.timelineImageCache.keys().next().value);
-    }
-  }
-
   function hideTimelinePreview(state) {
     state.timelineHovering = false;
     state.timelineHoverToken += 1;
+    state.timelineDesiredUrl = '';
     state.controls.timelinePreview.hidden = true;
   }
 
-  function applyTimelineFrame(state, frame, position, token) {
-    if (
-      activeOverlay !== state ||
-      !state.timelineHovering ||
-      token !== state.timelineHoverToken
-    ) {
+  function getTimelineImageUrl(image) {
+    return image && typeof image.src === 'string' ? image.src : '';
+  }
+
+  function getTimelineRequestState(state) {
+    return {
+      active: activeOverlay === state,
+      hovering: state.timelineHovering,
+      token: state.timelineHoverToken,
+      desiredUrl: state.timelineDesiredUrl,
+      displayedUrl: state.timelineDisplayedUrl
+    };
+  }
+
+  function isCurrentTimelineFrame(state, token, url) {
+    const requestState = getTimelineRequestState(state);
+    return captionUtils.isStoryboardFrameCurrent
+      ? captionUtils.isStoryboardFrameCurrent(requestState, token, url)
+      : requestState.active && requestState.hovering &&
+        requestState.token === token && requestState.desiredUrl === url;
+  }
+
+  function canApplyTimelineFrame(state, token, url, image) {
+    const requestState = getTimelineRequestState(state);
+    const stateMatches = captionUtils.canApplyStoryboardFrame
+      ? captionUtils.canApplyStoryboardFrame(requestState, token, url)
+      : isCurrentTimelineFrame(state, token, url) &&
+        requestState.displayedUrl === url;
+    return stateMatches && getTimelineImageUrl(image) === url;
+  }
+
+  function logStaleTimelineFrame(state, frame, position, token, displayedUrl, reason) {
+    debugLog('Storyboard', 'frameIgnored', {
+      token: token,
+      timestamp: position.seconds,
+      videoId: state.videoId,
+      frameIndex: frame.frameIndex,
+      spriteIndex: frame.spriteIndex,
+      cellIndex: frame.cellIndex,
+      requestedUrl: getDebugUrl(frame.url),
+      displayedUrl: getDebugUrl(displayedUrl),
+      ignoredAsStale: true,
+      reason: reason
+    });
+  }
+
+  function applyTimelineFrame(state, frame, position, token, imageLoadResult) {
+    const image = state.controls.timelineImage;
+    const displayedUrl = getTimelineImageUrl(image);
+    if (!canApplyTimelineFrame(state, token, frame.url, image)) {
+      logStaleTimelineFrame(state, frame, position, token, displayedUrl, 'commit-check');
       return;
     }
 
-    const image = state.controls.timelineImage;
     const preview = state.controls.timelinePreview;
     preview.style.setProperty('--ytpm-timeline-preview-left', position.leftPx + 'px');
     preview.style.width = frame.width + 'px';
@@ -2308,6 +3129,22 @@
     image.style.transform = 'translate(-' + frame.x + 'px, -' + frame.y + 'px)';
     state.controls.timelineTime.textContent = formatTime(position.seconds);
     preview.hidden = false;
+    debugLog('Storyboard', 'frameApplied', {
+      token: token,
+      timestamp: position.seconds,
+      videoId: state.videoId,
+      frameIndex: frame.frameIndex,
+      framesPerSprite: frame.framesPerSprite,
+      spriteIndex: frame.spriteIndex,
+      cellIndex: frame.cellIndex,
+      x: frame.x,
+      y: frame.y,
+      requestedUrl: getDebugUrl(frame.url),
+      displayedUrl: getDebugUrl(displayedUrl),
+      imageLoadResult: imageLoadResult || 'applied',
+      applied: true,
+      ignoredAsStale: false
+    });
   }
 
   function loadTimelineFrame(state, frame, position, token) {
@@ -2318,27 +3155,131 @@
     }
 
     const image = state.controls.timelineImage;
-    const apply = function () {
-      rememberTimelineImage(state, frame.url);
-      applyTimelineFrame(state, frame, position, token);
-    };
+    const requestedUrl = frame.url;
+    const displayedUrl = getTimelineImageUrl(image);
+    const sameSpriteReady = state.timelineDisplayedUrl === requestedUrl &&
+      displayedUrl === requestedUrl && image.complete && image.naturalWidth > 0;
+    debugLog('Storyboard', 'frameRequested', {
+      token: token,
+      timestamp: position.seconds,
+      videoId: state.videoId,
+      frameIndex: frame.frameIndex,
+      framesPerSprite: frame.framesPerSprite,
+      spriteIndex: frame.spriteIndex,
+      cellIndex: frame.cellIndex,
+      x: frame.x,
+      y: frame.y,
+      requestedUrl: getDebugUrl(requestedUrl),
+      displayedUrl: getDebugUrl(displayedUrl),
+      cacheHit: sameSpriteReady,
+      loadStarted: !sameSpriteReady
+    });
 
-    if (state.timelineImageCache.has(frame.url)) {
-      apply();
+    if (sameSpriteReady) {
+      applyTimelineFrame(state, frame, position, token, 'same-sprite');
       return;
     }
 
     state.controls.timelinePreview.hidden = true;
-    image.onload = apply;
-    image.onerror = function (error) {
-      reportError('timeline-preview-image', error);
-      if (activeOverlay === state && token === state.timelineHoverToken) {
-        state.controls.timelinePreview.hidden = true;
-      }
+    if (typeof Image !== 'function') {
+      debugLog('Storyboard', 'frameFailed', {
+        token: token,
+        timestamp: position.seconds,
+        videoId: state.videoId,
+        frameIndex: frame.frameIndex,
+        framesPerSprite: frame.framesPerSprite,
+        spriteIndex: frame.spriteIndex,
+        cellIndex: frame.cellIndex,
+        x: frame.x,
+        y: frame.y,
+        requestedUrl: getDebugUrl(requestedUrl),
+        displayedUrl: getDebugUrl(displayedUrl),
+        imageLoadResult: 'unavailable',
+        loadCompleted: false
+      });
+      return;
+    }
+
+    const loader = new Image();
+    let settled = false;
+    const ignoreIfStale = function (reason) {
+      logStaleTimelineFrame(state, frame, position, token, getTimelineImageUrl(image), reason);
     };
-    image.src = frame.url;
-    if (image.complete && image.naturalWidth > 0) {
-      apply();
+    const commitLoadedSprite = function (imageLoadResult) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+
+      const loaderUrl = getTimelineImageUrl(loader);
+      if (!loader.complete || loader.naturalWidth <= 0 || loaderUrl !== requestedUrl) {
+        debugLog('Storyboard', 'frameIgnored', {
+          token: token,
+          timestamp: position.seconds,
+          requestedUrl: getDebugUrl(requestedUrl),
+          displayedUrl: getDebugUrl(getTimelineImageUrl(image)),
+          ignoredAsStale: true,
+          reason: 'loader-not-ready'
+        });
+        return;
+      }
+      if (!isCurrentTimelineFrame(state, token, requestedUrl)) {
+        ignoreIfStale('request-check');
+        return;
+      }
+
+      image.src = requestedUrl;
+      const nextDisplayedUrl = getTimelineImageUrl(image);
+      if (nextDisplayedUrl !== requestedUrl) {
+        ignoreIfStale('visible-source-mismatch');
+        return;
+      }
+
+      state.timelineDisplayedUrl = nextDisplayedUrl;
+      applyTimelineFrame(state, frame, position, token, imageLoadResult);
+    };
+
+    loader.onload = function () {
+      debugLog('Storyboard', 'loadCompleted', {
+        token: token,
+        timestamp: position.seconds,
+        requestedUrl: getDebugUrl(requestedUrl),
+        displayedUrl: getDebugUrl(getTimelineImageUrl(image)),
+        loadCompleted: true
+      });
+      commitLoadedSprite('loaded');
+    };
+    loader.onerror = function (error) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reportError('timeline-preview-image', error);
+      debugLog('Storyboard', 'frameFailed', {
+        token: token,
+        timestamp: position.seconds,
+        videoId: state.videoId,
+        frameIndex: frame.frameIndex,
+        framesPerSprite: frame.framesPerSprite,
+        spriteIndex: frame.spriteIndex,
+        cellIndex: frame.cellIndex,
+        x: frame.x,
+        y: frame.y,
+        requestedUrl: getDebugUrl(requestedUrl),
+        displayedUrl: getDebugUrl(getTimelineImageUrl(image)),
+        imageLoadResult: 'error',
+        loadCompleted: false
+      });
+    };
+    debugLog('Storyboard', 'loadStarted', {
+      token: token,
+      timestamp: position.seconds,
+      requestedUrl: getDebugUrl(requestedUrl),
+      displayedUrl: getDebugUrl(getTimelineImageUrl(image))
+    });
+    loader.src = requestedUrl;
+    if (loader.complete && loader.naturalWidth > 0) {
+      commitLoadedSprite('already-complete');
     }
   }
 
@@ -2354,10 +3295,25 @@
       getPreviewDuration(state)
     );
     if (!frame) {
+      state.timelineDesiredUrl = '';
       hideTimelinePreview(state);
       return;
     }
 
+    state.timelineDesiredUrl = frame.url;
+    debugLog('Storyboard', 'frameMapped', {
+      token: token,
+      timestamp: position.seconds,
+      videoId: state.videoId,
+      duration: getPreviewDuration(state),
+      frameIndex: frame.frameIndex,
+      framesPerSprite: frame.framesPerSprite,
+      spriteIndex: frame.spriteIndex,
+      cellIndex: frame.cellIndex,
+      x: frame.x,
+      y: frame.y,
+      requestedUrl: getDebugUrl(frame.url)
+    });
     loadTimelineFrame(state, frame, position, token);
   }
 
@@ -2372,6 +3328,7 @@
 
     if (!getPreviewDuration(state)) {
       state.timelineHoverPosition = null;
+      state.timelineDesiredUrl = '';
       state.controls.timelinePreview.hidden = true;
       if (!state.captionCatalogLoaded && !state.timelineMetadataRequest) {
         const metadataRequest = requestCaptionCatalog(state);
@@ -2412,6 +3369,7 @@
       return;
     }
 
+    state.timelineDesiredUrl = '';
     state.controls.timelinePreview.hidden = false;
     requestCaptionCatalog(state).then(function (catalog) {
       if (activeOverlay !== state || !state.timelineHovering) {
@@ -2439,6 +3397,582 @@
     });
   }
 
+  function readVideoCurrentTime(state) {
+    const value = Number(state.video && state.video.currentTime);
+    return Number.isFinite(value) && value >= 0 && value <= SEEK_MAX_SECONDS
+      ? value
+      : null;
+  }
+
+  function readPlayerCurrentTime(state) {
+    if (!state.playerApi) {
+      state.playerApi = getYoutubePlayerApi(state.video);
+    }
+
+    if (!state.playerApi || typeof state.playerApi.getCurrentTime !== 'function') {
+      return null;
+    }
+
+    try {
+      const value = Number(state.playerApi.getCurrentTime());
+      return Number.isFinite(value) && value >= 0 && value <= SEEK_MAX_SECONDS
+        ? value
+        : null;
+    } catch (error) {
+      reportError('seek-player-current-time', error);
+      return null;
+    }
+  }
+
+  function readBufferedRanges(video) {
+    const ranges = [];
+    if (!video || !video.buffered) {
+      return ranges;
+    }
+
+    try {
+      for (let index = 0; index < video.buffered.length && index < 100; index += 1) {
+        const start = Number(video.buffered.start(index));
+        const end = Number(video.buffered.end(index));
+        if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start) {
+          ranges.push({ start: start, end: end });
+        }
+      }
+    } catch (error) {
+      reportError('seek-buffered-ranges', error);
+    }
+
+    return ranges;
+  }
+
+  function getSeekSnapshot(state) {
+    const videoDuration = Number(state.video && state.video.duration);
+    const metadataDuration = Number(state.duration);
+    const playerCurrentTime = readPlayerCurrentTime(state);
+    const videoCurrentTime = readVideoCurrentTime(state);
+
+    return {
+      videoCurrentTime: videoCurrentTime,
+      playerCurrentTime: playerCurrentTime,
+      playerFound: Boolean(state.playerApi),
+      playerSeekToAvailable: Boolean(
+        state.playerApi && typeof state.playerApi.seekTo === 'function'
+      ),
+      videoDuration: Number.isFinite(videoDuration) && videoDuration >= 0
+        ? videoDuration
+        : null,
+      metadataDuration: Number.isFinite(metadataDuration) && metadataDuration > 0
+        ? metadataDuration
+        : null,
+      bufferedRanges: readBufferedRanges(state.video)
+    };
+  }
+
+  function isCurrentSeekRequest(state, requestId) {
+    if (captionUtils.isSeekRequestCurrent) {
+      return captionUtils.isSeekRequestCurrent({
+        active: activeOverlay === state,
+        requestId: state.seekRequestId
+      }, requestId);
+    }
+
+    return activeOverlay === state && state.seekRequestId === requestId;
+  }
+
+  function isSeekWithinToleranceValue(actualTime, requestedTime, tolerance) {
+    if (captionUtils.isSeekWithinTolerance) {
+      return captionUtils.isSeekWithinTolerance(
+        actualTime,
+        requestedTime,
+        Number.isFinite(Number(tolerance)) ? Number(tolerance) : SEEK_CONFIRM_TOLERANCE
+      );
+    }
+
+    if (actualTime === null || actualTime === undefined ||
+      requestedTime === null || requestedTime === undefined) {
+      return false;
+    }
+
+    const actual = Number(actualTime);
+    const requested = Number(requestedTime);
+    return Number.isFinite(actual) && Number.isFinite(requested) &&
+      Math.abs(actual - requested) <= (
+        Number.isFinite(Number(tolerance)) ? Number(tolerance) : SEEK_CONFIRM_TOLERANCE
+      );
+  }
+
+  function isSeekNoOpValue(actualTime, requestedTime) {
+    if (captionUtils.isSeekNoOp) {
+      return captionUtils.isSeekNoOp(
+        actualTime,
+        requestedTime,
+        SEEK_NOOP_EPSILON
+      );
+    }
+
+    return isSeekWithinToleranceValue(actualTime, requestedTime, SEEK_NOOP_EPSILON);
+  }
+
+  function isTimeBufferedValue(bufferedRanges, seconds) {
+    if (captionUtils.isTimeBuffered) {
+      return captionUtils.isTimeBuffered(
+        bufferedRanges,
+        seconds,
+        SEEK_BUFFER_SAFETY_MARGIN
+      );
+    }
+
+    return false;
+  }
+
+  function clearSeekConfirmationTimer(state) {
+    if (state.seekConfirmationTimer) {
+      window.clearTimeout(state.seekConfirmationTimer);
+      state.seekConfirmationTimer = 0;
+    }
+  }
+
+  function restoreSeekPlaybackState(state, wasPaused) {
+    if (wasPaused) {
+      if (!state.video.paused) {
+        pauseVideoSafely(state);
+      }
+      return;
+    }
+
+    if (state.video.paused && !state.video.ended && !state.userPaused) {
+      schedulePreviewPlayback(state, 0);
+    }
+  }
+
+  function finishSeekRequest(state, request, confirmed, reason) {
+    if (!isCurrentSeekRequest(state, request.requestId)) {
+      return;
+    }
+
+    clearSeekConfirmationTimer(state);
+    const after = getSeekSnapshot(state);
+    const videoConfirmed = isSeekWithinToleranceValue(
+      after.videoCurrentTime,
+      request.targetTime,
+      SEEK_CONFIRM_TOLERANCE
+    );
+    const playerConfirmed = isSeekWithinToleranceValue(
+      after.playerCurrentTime,
+      request.targetTime,
+      SEEK_CONFIRM_TOLERANCE
+    );
+    const finalConfirmed = after.videoCurrentTime !== null
+      ? videoConfirmed
+      : playerConfirmed;
+    const snapbackDetected = !finalConfirmed && (
+      after.videoCurrentTime !== null
+        ? !videoConfirmed
+        : after.playerCurrentTime !== null && !playerConfirmed
+    );
+
+    debugLog('Seek', 'confirmation', {
+      rangeValue: request.rangeValue,
+      requestedTime: request.targetTime,
+      videoCurrentTimeBefore: request.before.videoCurrentTime,
+      videoCurrentTimeAfter: after.videoCurrentTime,
+      playerFound: request.bridgeResult && request.bridgeResult.playerFound === true
+        ? true
+        : after.playerFound,
+      playerSeekToAvailable: request.bridgeResult &&
+        request.bridgeResult.seekToAvailable === true
+        ? true
+        : after.playerSeekToAvailable,
+      playerCurrentTimeBefore: request.before.playerCurrentTime,
+      playerCurrentTimeAfter: after.playerCurrentTime,
+      videoDuration: after.videoDuration,
+      metadataDuration: after.metadataDuration,
+      bufferedRanges: after.bufferedRanges,
+      requestId: request.requestId,
+      controller: request.controller,
+      confirmed: finalConfirmed,
+      reason: reason,
+      snapbackDetected: snapbackDetected
+    });
+
+    state.seekPending = false;
+    state.seekDragging = false;
+    state.pendingSeekTime = null;
+    state.seekConfirmationCheck = null;
+    scheduleVideoControlUpdate(state);
+
+    if (finalConfirmed && request.restorePlayback !== false) {
+      restoreSeekPlaybackState(state, request.wasPaused);
+    }
+  }
+
+  function applySeekPrecisionCorrection(state, request, reason) {
+    if (request.precisionCorrectionApplied) {
+      return true;
+    }
+
+    const applied = setVideoPropertySafely(
+      state,
+      'currentTime',
+      request.targetTime
+    );
+    if (applied) {
+      request.precisionCorrectionApplied = true;
+    }
+    debugLog('Seek', 'precisionCorrection', {
+      rangeValue: request.rangeValue,
+      requestedTime: request.targetTime,
+      videoCurrentTimeBefore: request.before.videoCurrentTime,
+      videoCurrentTimeAfter: readVideoCurrentTime(state),
+      playerFound: Boolean(state.playerApi),
+      playerSeekToAvailable: Boolean(
+        state.playerApi && typeof state.playerApi.seekTo === 'function'
+      ),
+      playerCurrentTimeBefore: request.before.playerCurrentTime,
+      playerCurrentTimeAfter: readPlayerCurrentTime(state),
+      videoDuration: Number.isFinite(Number(state.video.duration))
+        ? Number(state.video.duration)
+        : null,
+      metadataDuration: Number.isFinite(Number(state.duration))
+        ? Number(state.duration)
+        : null,
+      bufferedRanges: readBufferedRanges(state.video),
+      requestId: request.requestId,
+      confirmed: false,
+      snapbackDetected: false,
+      correctionReason: reason,
+      precisionCorrectionApplied: request.precisionCorrectionApplied,
+      applied: applied
+    });
+    return applied;
+  }
+
+  function confirmSeekRequest(state, request) {
+    const deadline = Date.now() + SEEK_CONFIRM_TIMEOUT_MS;
+
+    const check = function () {
+      if (!isCurrentSeekRequest(state, request.requestId)) {
+        return;
+      }
+      clearSeekConfirmationTimer(state);
+
+      const current = getSeekSnapshot(state);
+      const videoConfirmed = isSeekWithinToleranceValue(
+        current.videoCurrentTime,
+        request.targetTime,
+        SEEK_CONFIRM_TOLERANCE
+      );
+      const playerConfirmed = isSeekWithinToleranceValue(
+        current.playerCurrentTime,
+        request.targetTime,
+        SEEK_CONFIRM_TOLERANCE
+      );
+      const currentConfirmed = current.videoCurrentTime !== null
+        ? videoConfirmed
+        : playerConfirmed;
+      if (currentConfirmed || Date.now() >= deadline) {
+        finishSeekRequest(
+          state,
+          request,
+          currentConfirmed,
+          currentConfirmed
+            ? 'confirmed'
+            : 'timeout'
+        );
+        return;
+      }
+
+      state.seekConfirmationTimer = window.setTimeout(check, SEEK_CONFIRM_POLL_MS);
+    };
+
+    state.seekConfirmationCheck = check;
+    check();
+  }
+
+  function waitForSeekPrecision(state, request) {
+    const deadline = Date.now() + SEEK_PRECISION_TIMEOUT_MS;
+
+    const check = function () {
+      if (!isCurrentSeekRequest(state, request.requestId)) {
+        return;
+      }
+      clearSeekConfirmationTimer(state);
+      const snapshot = getSeekSnapshot(state);
+      const targetBuffered = isTimeBufferedValue(
+        snapshot.bufferedRanges,
+        request.targetTime
+      );
+      debugLog('Seek', 'precisionStage', {
+        rangeValue: request.rangeValue,
+        requestedTime: request.targetTime,
+        videoCurrentTimeBefore: request.before.videoCurrentTime,
+        videoCurrentTimeAfter: snapshot.videoCurrentTime,
+        playerFound: request.bridgeResult && request.bridgeResult.playerFound === true
+          ? true
+          : snapshot.playerFound,
+        playerSeekToAvailable: request.bridgeResult &&
+          request.bridgeResult.seekToAvailable === true
+          ? true
+          : snapshot.playerSeekToAvailable,
+        playerCurrentTimeBefore: request.before.playerCurrentTime,
+        playerCurrentTimeAfter: snapshot.playerCurrentTime,
+        videoDuration: snapshot.videoDuration,
+        metadataDuration: snapshot.metadataDuration,
+        bufferedRanges: snapshot.bufferedRanges,
+        requestId: request.requestId,
+        confirmed: false,
+        snapbackDetected: false,
+        targetBuffered: targetBuffered,
+        precisionCorrectionApplied: request.precisionCorrectionApplied,
+        controller: request.controller
+      });
+
+      if (targetBuffered) {
+        request.controller = 'player-load+video-precision';
+        if (!applySeekPrecisionCorrection(state, request, 'target-buffered')) {
+          finishSeekRequest(state, request, false, 'precision-apply-failed');
+          return;
+        }
+        confirmSeekRequest(state, request);
+        return;
+      }
+
+      if (Date.now() >= deadline) {
+        finishSeekRequest(state, request, false, 'precision-timeout');
+        return;
+      }
+
+      state.seekConfirmationTimer = window.setTimeout(check, SEEK_CONFIRM_POLL_MS);
+    };
+
+    state.seekConfirmationCheck = check;
+    check();
+  }
+
+  function seekPreviewTo(state, requestedTime, options) {
+    if (!state.video || !state.video.isConnected) {
+      return false;
+    }
+
+    const duration = getPreviewDuration(state);
+    if (!duration) {
+      return false;
+    }
+
+    const numericTime = Number(requestedTime);
+    const before = getSeekSnapshot(state);
+    const currentTimeForPlan = before.videoCurrentTime !== null
+      ? before.videoCurrentTime
+      : before.playerCurrentTime;
+    const seekPlan = captionUtils.getSeekCommitPlan
+      ? captionUtils.getSeekCommitPlan(
+        currentTimeForPlan,
+        numericTime,
+        duration,
+        SEEK_NOOP_EPSILON
+      )
+      : {
+        targetTime: clampSeekTimeValue(numericTime, duration),
+        shouldSeek: !isSeekNoOpValue(currentTimeForPlan, numericTime)
+      };
+    const targetTime = seekPlan.targetTime;
+    const rangeValue = options && options.rangeValue !== undefined
+      ? options.rangeValue
+      : numericTime;
+    const wasPaused = state.video.paused || state.video.ended;
+    const requestId = ++state.seekRequestId;
+    clearSeekConfirmationTimer(state);
+    state.seekConfirmationCheck = null;
+    state.seekDragging = false;
+    state.seekPending = true;
+    state.pendingSeekTime = targetTime;
+    const request = {
+      requestId: requestId,
+      rangeValue: Number.isFinite(Number(rangeValue)) ? Number(rangeValue) : null,
+      targetTime: targetTime,
+      before: before,
+      wasPaused: wasPaused,
+      controller: 'video',
+      bridgeResult: null,
+      precisionCorrectionApplied: false,
+      restorePlayback: true
+    };
+
+    scheduleVideoControlUpdate(state);
+
+    if (!seekPlan.shouldSeek || isSeekNoOpValue(currentTimeForPlan, targetTime)) {
+      request.restorePlayback = false;
+      finishSeekRequest(state, request, true, 'no-op');
+      return true;
+    }
+
+    debugLog('Seek', 'request', {
+      rangeValue: request.rangeValue,
+      requestedTime: request.targetTime,
+      videoCurrentTimeBefore: before.videoCurrentTime,
+      videoCurrentTimeAfter: null,
+      playerFound: before.playerFound,
+      playerSeekToAvailable: before.playerSeekToAvailable,
+      playerCurrentTimeBefore: before.playerCurrentTime,
+      playerCurrentTimeAfter: null,
+      videoDuration: before.videoDuration,
+      metadataDuration: before.metadataDuration,
+      bufferedRanges: before.bufferedRanges,
+      requestId: requestId,
+      controller: 'pending'
+    });
+
+    if (isTimeBufferedValue(before.bufferedRanges, targetTime)) {
+      request.controller = 'video-buffered';
+      if (!applySeekPrecisionCorrection(state, request, 'target-already-buffered')) {
+        finishSeekRequest(state, request, false, 'precision-apply-failed');
+        return true;
+      }
+      confirmSeekRequest(state, request);
+      return true;
+    }
+
+    const bridgePayload = {
+      videoId: state.videoId,
+      seconds: targetTime,
+      allowSeekAhead: true
+    };
+    requestPageBridge('seek-preview', bridgePayload, PAGE_BRIDGE_TIMEOUT_MS)
+      .then(function (result) {
+        if (!isCurrentSeekRequest(state, requestId)) {
+          return;
+        }
+
+        request.bridgeResult = result;
+        const usePlayerController = result && result.ok === true &&
+          result.seekToAvailable === true;
+        const controller = captionUtils.getSeekController
+          ? captionUtils.getSeekController(usePlayerController)
+          : usePlayerController ? 'player' : 'video';
+        request.controller = controller === 'player' ? 'player-load' : 'video-fallback';
+
+        let applied = true;
+        if (request.controller === 'player-load') {
+          waitForSeekPrecision(state, request);
+        } else {
+          applied = applySeekPrecisionCorrection(state, request, 'player-unavailable');
+        }
+
+        const afterApply = getSeekSnapshot(state);
+        debugLog('Seek', 'commit', {
+          rangeValue: request.rangeValue,
+          requestedTime: request.targetTime,
+          videoCurrentTimeBefore: request.before.videoCurrentTime,
+          videoCurrentTimeAfter: afterApply.videoCurrentTime,
+          playerFound: result && result.playerFound === true
+            ? true
+            : afterApply.playerFound,
+          playerSeekToAvailable: result && result.seekToAvailable === true
+            ? true
+            : afterApply.playerSeekToAvailable,
+          playerCurrentTimeBefore: request.before.playerCurrentTime,
+          playerCurrentTimeAfter: result && result.playerCurrentTimeAfter !== null
+            ? result.playerCurrentTimeAfter
+            : afterApply.playerCurrentTime,
+          videoDuration: afterApply.videoDuration,
+          metadataDuration: afterApply.metadataDuration,
+          bufferedRanges: afterApply.bufferedRanges,
+          requestId: requestId,
+          controller: request.controller,
+          bridgeOk: Boolean(result && result.ok),
+          applied: applied,
+          precisionCorrectionApplied: request.precisionCorrectionApplied
+        });
+
+        if (!applied) {
+          finishSeekRequest(state, request, false, 'apply-failed');
+          return;
+        }
+
+        if (request.controller !== 'player-load') {
+          confirmSeekRequest(state, request);
+        }
+      })
+      .catch(function (error) {
+        if (!isCurrentSeekRequest(state, requestId)) {
+          return;
+        }
+
+        reportError('seek-bridge', error);
+        request.controller = 'video-fallback';
+        const applied = applySeekPrecisionCorrection(state, request, 'bridge-error');
+        debugLog('Seek', 'bridge-fallback', {
+          rangeValue: request.rangeValue,
+          requestedTime: request.targetTime,
+          requestId: requestId,
+          controller: request.controller,
+          applied: applied,
+          precisionCorrectionApplied: request.precisionCorrectionApplied
+        });
+        if (!applied) {
+          finishSeekRequest(state, request, false, 'apply-failed');
+          return;
+        }
+        confirmSeekRequest(state, request);
+      });
+
+    return true;
+  }
+
+  function readSeekInputTarget(state) {
+    return clampSeekTimeValue(
+      Number(state.controls.seekInput.value),
+      getPreviewDuration(state)
+    );
+  }
+
+  function beginSeekInteraction(state, event) {
+    clearSeekConfirmationTimer(state);
+    state.seekConfirmationCheck = null;
+    state.seekRequestId += 1;
+    state.seekInteractionId += 1;
+    state.seekCommittedInteractionId = 0;
+    state.seekDragging = true;
+    state.seekPending = true;
+    state.pendingSeekTime = readSeekInputTarget(state);
+    state.seekPointerId = event && Number.isFinite(event.pointerId)
+      ? event.pointerId
+      : null;
+    scheduleVideoControlUpdate(state);
+  }
+
+  function commitSeekInteraction(state) {
+    if (!state.seekDragging && !state.seekPending) {
+      beginSeekInteraction(state, null);
+    }
+
+    const targetTime = Number.isFinite(Number(state.pendingSeekTime))
+      ? state.pendingSeekTime
+      : readSeekInputTarget(state);
+    state.pendingSeekTime = targetTime;
+    state.seekDragging = false;
+    if (state.seekCommittedInteractionId === state.seekInteractionId) {
+      state.seekPointerId = null;
+      return;
+    }
+
+    state.seekCommittedInteractionId = state.seekInteractionId;
+    state.seekPointerId = null;
+    seekPreviewTo(state, targetTime, { rangeValue: state.controls.seekInput.value });
+  }
+
+  function cancelSeekInteraction(state) {
+    clearSeekConfirmationTimer(state);
+    state.seekConfirmationCheck = null;
+    state.seekRequestId += 1;
+    state.seekDragging = false;
+    state.seekPending = false;
+    state.pendingSeekTime = null;
+    state.seekConfirmationCheck = null;
+    state.seekPointerId = null;
+    scheduleVideoControlUpdate(state);
+  }
+
   function seekVideoBy(state, amount) {
     if (!state.video || !state.video.isConnected) {
       return;
@@ -2449,12 +3983,16 @@
       return;
     }
 
-    setVideoPropertySafely(
-      state,
-      'currentTime',
-      Math.max(0, Math.min(duration, state.video.currentTime + amount))
-    );
-    updateVideoControls(state);
+    const playerTime = readPlayerCurrentTime(state);
+    const videoTime = readVideoCurrentTime(state);
+    const currentTime = playerTime !== null ? playerTime : videoTime;
+    if (currentTime === null) {
+      return;
+    }
+
+    seekPreviewTo(state, currentTime + Number(amount || 0), {
+      rangeValue: currentTime + Number(amount || 0)
+    });
   }
 
   function togglePreviewPlayback(state) {
@@ -2502,13 +4040,29 @@
 
   function togglePreviewCaptions(state) {
     const tracks = getCaptionTracks(state.video);
-    if (tracks.length) {
+    if (state.captionTrackElement && tracks.length) {
       toggleSyntheticCaptionTracks(state, tracks);
       return;
     }
 
-    void loadPreviewCaptions(state).catch(function (error) {
+    if (state.captionTogglePending) {
+      return;
+    }
+    state.captionTogglePending = true;
+
+    void toggleNativeCaptions(state).then(function (nativeResult) {
+      if (activeOverlay !== state || nativeResult) {
+        if (activeOverlay === state && nativeResult && nativeResult.ok !== true) {
+          showPreviewNotice('YouTube captions could not be toggled.');
+        }
+        return;
+      }
+
+      return loadPreviewCaptions(state);
+    }).catch(function (error) {
       reportError('caption-toggle', error);
+    }).finally(function () {
+      state.captionTogglePending = false;
     });
   }
 
@@ -2734,6 +4288,8 @@
       'play',
       'pause',
       'timeupdate',
+      'seeking',
+      'seeked',
       'durationchange',
       'loadedmetadata',
       'progress',
@@ -2744,6 +4300,16 @@
     videoEvents.forEach(function (eventName) {
       registerListener(state.videoControlCleanup, state.video, eventName, function () {
         scheduleVideoControlUpdate(state);
+        if (state.seekPending && state.seekConfirmationCheck &&
+          (eventName === 'timeupdate' || eventName === 'seeking' ||
+            eventName === 'seeked')) {
+          state.seekConfirmationCheck();
+        }
+        if (eventName === 'timeupdate' || eventName === 'seeking' ||
+          eventName === 'seeked' || eventName === 'durationchange' ||
+          eventName === 'loadedmetadata') {
+          scheduleNativeCaptionMirrorUpdate(state);
+        }
         if ((eventName === 'durationchange' || eventName === 'loadedmetadata') &&
           state.timelineHovering) {
           updateTimelinePreview(state, state.timelineHoverClientX);
@@ -2789,6 +4355,7 @@
       updateTimelinePreview(state, event.clientX);
     });
     registerListener(state.controlCleanup, state.controls.seekInput, 'pointerdown', function (event) {
+      beginSeekInteraction(state, event);
       updateTimelinePreview(state, event.clientX);
     });
     registerListener(state.controlCleanup, state.controls.seekInput, 'pointerleave', function () {
@@ -2798,16 +4365,35 @@
       updateTimelinePreview(state, null);
     });
     registerListener(state.controlCleanup, state.controls.seekInput, 'blur', function () {
+      if (state.seekDragging) {
+        commitSeekInteraction(state);
+      }
       hideTimelinePreview(state);
     });
     registerListener(state.controlCleanup, state.controls.seekInput, 'input', function () {
-      updateTimelinePreview(state, state.timelineHoverClientX);
-      const value = Number(state.controls.seekInput.value);
-      if (Number.isFinite(value)) {
-        if (setVideoPropertySafely(state, 'currentTime', value)) {
-          scheduleVideoControlUpdate(state);
-        }
+      if (!state.seekDragging) {
+        beginSeekInteraction(state, null);
       }
+
+      state.pendingSeekTime = readSeekInputTarget(state);
+      state.seekPending = true;
+      updateTimelinePreview(state, state.timelineHoverClientX);
+      scheduleVideoControlUpdate(state);
+    });
+    registerListener(state.controlCleanup, state.controls.seekInput, 'change', function () {
+      commitSeekInteraction(state);
+    });
+    registerListener(state.controlCleanup, state.controls.seekInput, 'pointercancel', function () {
+      cancelSeekInteraction(state);
+      hideTimelinePreview(state);
+    });
+    registerListener(state.controlCleanup, document, 'pointerup', function (event) {
+      if (!state.seekDragging ||
+        (state.seekPointerId !== null && Number.isFinite(event.pointerId) &&
+          event.pointerId !== state.seekPointerId)) {
+        return;
+      }
+      commitSeekInteraction(state);
     });
     registerListener(state.controlCleanup, state.controls.qualityButton, 'click', function () {
       showOverlayControls(state);
@@ -2828,6 +4414,11 @@
 
     if (state.video.textTracks && typeof state.video.textTracks.addEventListener === 'function') {
       registerListener(state.videoControlCleanup, state.video.textTracks, 'addtrack', function () {
+        scheduleNativeCaptionMirrorUpdate(state);
+        updateCaptionControl(state);
+      });
+      registerListener(state.videoControlCleanup, state.video.textTracks, 'change', function () {
+        scheduleNativeCaptionMirrorUpdate(state);
         updateCaptionControl(state);
       });
     }
@@ -2955,11 +4546,21 @@
       state.controlsFrame = 0;
     }
 
+    state.seekRequestId += 1;
+    clearSeekConfirmationTimer(state);
+    state.seekConfirmationCheck = null;
+    state.seekDragging = false;
+    state.seekPending = false;
+    state.pendingSeekTime = null;
+    state.seekPointerId = null;
     hideTimelinePreview(state);
+    state.captionRequestId += 1;
+    disposeNativeCaptionMirror(state);
     state.controls.timelineImage.onload = null;
     state.controls.timelineImage.onerror = null;
     state.controls.timelineImage.removeAttribute('src');
-    state.timelineImageCache.clear();
+    state.timelineDesiredUrl = '';
+    state.timelineDisplayedUrl = '';
 
     state.controlCleanup.forEach(function (cleanup) {
       cleanup();
@@ -3073,7 +4674,8 @@
     const videoState = captureVideoState(video);
     const playerApi = getYoutubePlayerApi(video);
     const cardVideoKey = getCardVideoKey(card);
-    const activePreview = findActivePreview(card);
+    const activePreview = findActivePreview(card) ||
+      findComposedAncestor(video, 'ytd-video-preview');
     const previewVideoKey = activePreview ? getPreviewVideoKey(activePreview) : null;
     const elements = createOverlayElements();
 
@@ -3101,6 +4703,18 @@
       videoControlCleanup: [],
       qualityOptionCleanup: [],
       playerApi: playerApi,
+      nativePreview: activePreview,
+      nativeCaptionObserver: null,
+      nativePreviewObserver: null,
+      nativePreviewObserved: null,
+      nativeCaptionRenderer: null,
+      nativeCaptionSyncTimer: 0,
+      nativeCaptionState: null,
+      nativeCaptionText: '',
+      captionGeneration: 0,
+      captionActiveWindows: new Set(),
+      captionWindowGenerations: new Map(),
+      captionLastMutationDebug: null,
       captionInfo: null,
       captionCatalog: null,
       captionCatalogLoaded: false,
@@ -3108,6 +4722,7 @@
       duration: 0,
       storyboard: null,
       captionRequestId: 0,
+      captionTogglePending: false,
       captionLoadPending: false,
       captionTrackElement: null,
       captionTrackLoadHandler: null,
@@ -3125,7 +4740,17 @@
       timelineHoverPosition: null,
       timelineHoverToken: 0,
       timelineMetadataRequest: null,
-      timelineImageCache: new Map(),
+      timelineDesiredUrl: '',
+      timelineDisplayedUrl: '',
+      seekDragging: false,
+      seekPending: false,
+      pendingSeekTime: null,
+      seekRequestId: 0,
+      seekConfirmationTimer: 0,
+      seekConfirmationCheck: null,
+      seekInteractionId: 0,
+      seekCommittedInteractionId: 0,
+      seekPointerId: null,
       inertedElements: [],
       userPaused: false
     };
@@ -3244,6 +4869,13 @@
       video.addEventListener('emptied', state.handleVideoInterruption);
       video.addEventListener('loadedmetadata', state.handleVideoInterruption);
       activeOverlay = state;
+      debugLog('Preview', 'overlay mounted', {
+        videoId: state.videoId,
+        videoElementFound: Boolean(state.video),
+        nativePreviewFound: Boolean(state.nativePreview),
+        playerFound: Boolean(getNativePreviewPlayer(state.nativePreview)),
+        nativePlayerFound: Boolean(getNativePreviewPlayer(state.nativePreview))
+      });
       lockPageScroll();
       setPageInert(state);
       bindVideoControls(state);

@@ -55,6 +55,173 @@
     return '';
   }
 
+  function normalizeCaptionLines(values) {
+    const source = Array.isArray(values) ? values : [values];
+    const lines = [];
+
+    source.forEach(function (value) {
+      if (typeof value !== 'string') {
+        return;
+      }
+
+      value.replace(/\r\n?/g, '\n').split('\n').forEach(function (line) {
+        const normalized = line.replace(/[ \t]+/g, ' ').trim();
+        if (!normalized || lines[lines.length - 1] === normalized) {
+          return;
+        }
+        lines.push(normalized);
+      });
+    });
+
+    return lines.join('\n');
+  }
+
+  function normalizeCaptionState(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { available: false, enabled: false };
+    }
+
+    return {
+      available: value.available === true,
+      enabled: value.available === true && value.enabled === true
+    };
+  }
+
+  function resolveCaptionEnabledState(controlState, hasShowingTextTrack, hasVisibleRendererText) {
+    if (controlState === true) {
+      return true;
+    }
+    if (controlState === false) {
+      return false;
+    }
+    return Boolean(hasShowingTextTrack || hasVisibleRendererText);
+  }
+
+  function getCaptionTogglePlan(currentEnabled, desiredEnabled) {
+    const current = currentEnabled === true;
+    const desired = desiredEnabled === true;
+    return {
+      desiredEnabled: desired,
+      shouldChange: current !== desired
+    };
+  }
+
+  function isCaptionButtonPressed(value) {
+    return value === true || value === 'true';
+  }
+
+  function clampSeekTime(value, duration) {
+    const safeDuration = normalizeDuration(duration);
+    const numericValue = Number(value);
+    if (!safeDuration || !Number.isFinite(numericValue)) {
+      return 0;
+    }
+
+    return Math.max(0, Math.min(safeDuration, numericValue));
+  }
+
+  function getSeekDisplayTime(actualTime, pendingTime, seekDragging, seekPending, duration) {
+    const displayTime = seekDragging || seekPending ? pendingTime : actualTime;
+    return clampSeekTime(displayTime, duration);
+  }
+
+  function isSeekWithinTolerance(actualTime, requestedTime, tolerance) {
+    if (actualTime === null || actualTime === undefined ||
+      requestedTime === null || requestedTime === undefined ||
+      actualTime === '' || requestedTime === '') {
+      return false;
+    }
+
+    const actual = Number(actualTime);
+    const requested = Number(requestedTime);
+    const safeTolerance = Number.isFinite(Number(tolerance)) && Number(tolerance) >= 0
+      ? Number(tolerance)
+      : 0.75;
+    return Number.isFinite(actual) && Number.isFinite(requested) &&
+      Math.abs(actual - requested) <= safeTolerance;
+  }
+
+  function isSeekNoOp(actualTime, requestedTime, epsilon) {
+    const safeEpsilon = Number.isFinite(Number(epsilon)) && Number(epsilon) >= 0
+      ? Number(epsilon)
+      : 0.15;
+    return isSeekWithinTolerance(actualTime, requestedTime, safeEpsilon);
+  }
+
+  function getSeekCommitPlan(currentTime, requestedTime, duration, epsilon) {
+    const targetTime = clampSeekTime(requestedTime, duration);
+    return {
+      targetTime: targetTime,
+      shouldSeek: !isSeekNoOp(currentTime, targetTime, epsilon)
+    };
+  }
+
+  function isTimeBuffered(bufferedRanges, seconds, margin) {
+    if (!Array.isArray(bufferedRanges)) {
+      return false;
+    }
+
+    const target = Number(seconds);
+    const safeMargin = Number.isFinite(Number(margin)) && Number(margin) >= 0
+      ? Number(margin)
+      : 0;
+    if (!Number.isFinite(target)) {
+      return false;
+    }
+
+    return bufferedRanges.some(function (range) {
+      const start = Array.isArray(range) ? Number(range[0]) : Number(range && range.start);
+      const end = Array.isArray(range) ? Number(range[1]) : Number(range && range.end);
+      return Number.isFinite(start) && Number.isFinite(end) &&
+        end >= start &&
+        end - start >= safeMargin * 2 &&
+        target >= start + safeMargin &&
+        target <= end - safeMargin;
+    });
+  }
+
+  function selectCaptionWindowGeneration(previousActiveWindows, touchedWindows, currentWindows) {
+    const previous = Array.isArray(previousActiveWindows) ? previousActiveWindows : [];
+    const touched = Array.isArray(touchedWindows) ? touchedWindows : [];
+    const current = Array.isArray(currentWindows) ? currentWindows : [];
+    const currentSet = new Set(current);
+    const uniqueCurrent = function (values) {
+      return Array.from(new Set(values.filter(function (value) {
+        return currentSet.has(value);
+      })));
+    };
+    const touchedCurrent = uniqueCurrent(touched);
+    return touchedCurrent.length ? touchedCurrent : uniqueCurrent(previous);
+  }
+
+  function isSeekRequestCurrent(state, requestId) {
+    return Boolean(
+      state &&
+      state.active === true &&
+      state.requestId === requestId
+    );
+  }
+
+  function getSeekController(hasPlayerSeekTo) {
+    return hasPlayerSeekTo === true ? 'player' : 'video';
+  }
+
+  function isStoryboardFrameCurrent(state, token, url) {
+    return Boolean(
+      state &&
+      state.active === true &&
+      state.hovering === true &&
+      state.token === token &&
+      typeof url === 'string' &&
+      state.desiredUrl === url
+    );
+  }
+
+  function canApplyStoryboardFrame(state, token, url) {
+    return isStoryboardFrameCurrent(state, token, url) &&
+      state.displayedUrl === url;
+  }
+
   function getSafeCaptionUrl(rawUrl, allowedOrigin) {
     if (
       typeof rawUrl !== 'string' ||
@@ -139,11 +306,14 @@
     }
 
     const normalizedVideoId = normalizeVideoId(videoId);
+    if (!normalizedVideoId) {
+      return '';
+    }
     const template = rawTemplate
       .replace(/\{video_id\}/gi, normalizedVideoId)
       .trim();
 
-    if (!template || !template.includes('$N')) {
+    if (!template || !template.includes('$L') || !template.includes('$N')) {
       return '';
     }
 
@@ -165,7 +335,7 @@
     }
   }
 
-  function normalizeStoryboard(rawStoryboard, videoId) {
+  function normalizeStoryboard(rawStoryboard, videoId, duration) {
     if (!rawStoryboard || typeof rawStoryboard !== 'object') {
       return null;
     }
@@ -190,11 +360,31 @@
       return null;
     }
 
+    const normalizedDuration = normalizeDuration(
+      duration || rawStoryboard.duration
+    );
     const formats = rawFormats.slice(0, MAX_STORYBOARD_FORMATS).map(function (format, index) {
+      if (typeof format !== 'string' && (!format || typeof format !== 'object')) {
+        return null;
+      }
+
       const parts = typeof format === 'string'
         ? format.split('#')
         : [format.width, format.height, format.count, format.columns,
-          format.rows, format.intervalMs, format.name, format.signature];
+          format.rows,
+          Object.prototype.hasOwnProperty.call(format, 'sourceInterval')
+            ? format.sourceInterval
+            : Object.prototype.hasOwnProperty.call(format, 'interval')
+              ? format.interval
+              : format.intervalMs,
+          format.name, format.signature];
+
+      // YouTube currently emits exactly eight fields. The sixth field is
+      // retained for diagnostics/compatibility only; it is not frame timing.
+      if (parts.length !== 8) {
+        return null;
+      }
+
       const level = typeof format === 'object' && format !== null &&
         Number.isInteger(Number(format.level))
         ? Number(format.level)
@@ -204,8 +394,7 @@
       const count = Number(parts[2]);
       const columns = Number(parts[3]);
       const rows = Number(parts[4]);
-      const rawInterval = Number(parts[5]);
-      const intervalMs = rawInterval >= 1000 ? rawInterval : rawInterval * 1000;
+      const sourceInterval = Number(parts[5]);
 
       if (
         !Number.isInteger(width) || width < 1 || width > MAX_STORYBOARD_DIMENSION ||
@@ -213,11 +402,14 @@
         !Number.isInteger(count) || count < 1 || count > MAX_STORYBOARD_COUNT ||
         !Number.isInteger(columns) || columns < 1 || columns > 100 ||
         !Number.isInteger(rows) || rows < 1 || rows > 100 ||
-        !Number.isFinite(intervalMs) || intervalMs <= 0 || intervalMs > MAX_STORYBOARD_INTERVAL_MS
+        !Number.isFinite(sourceInterval) || sourceInterval < 0 ||
+        sourceInterval > MAX_STORYBOARD_INTERVAL_MS ||
+        !String(parts[6] || '').trim()
       ) {
         return null;
       }
 
+      const framesPerSprite = columns * rows;
       return {
         level: level,
         width: width,
@@ -225,9 +417,12 @@
         count: count,
         columns: columns,
         rows: rows,
-        intervalMs: intervalMs,
-        name: String(parts[6] || 'default').slice(0, 64),
-        signature: String(parts[7] || '').slice(0, 256)
+        sourceInterval: sourceInterval,
+        intervalMs: sourceInterval,
+        framesPerSprite: framesPerSprite,
+        spriteCount: Math.ceil(count / framesPerSprite),
+        name: String(parts[6]).slice(0, 128),
+        signature: String(parts[7] || '').slice(0, 512)
       };
     }).filter(Boolean);
 
@@ -237,12 +432,17 @@
 
     const recommendedFormat = formats.find(function (format) {
       return format.level === recommendedLevel;
-    }) || formats[0];
+    }) || formats.reduce(function (best, format) {
+      return !best || format.width * format.height > best.width * best.height
+        ? format
+        : best;
+    }, null);
 
     return {
       template: template,
       formats: formats,
-      recommendedLevel: recommendedFormat.level
+      recommendedLevel: recommendedFormat.level,
+      duration: normalizedDuration
     };
   }
 
@@ -251,24 +451,27 @@
       return null;
     }
 
-    const safeSeconds = Number.isFinite(seconds) && seconds >= 0 ? seconds : 0;
     const format = storyboard.formats.find(function (candidate) {
       return candidate.level === storyboard.recommendedLevel;
     }) || storyboard.formats[0];
-    const maxTime = Number.isFinite(duration) && duration > 0 ? duration : safeSeconds;
+    const maxTime = normalizeDuration(duration) || normalizeDuration(storyboard.duration);
+    if (!maxTime) {
+      return null;
+    }
+
+    const safeSeconds = Number.isFinite(seconds) && seconds >= 0 ? seconds : 0;
     const boundedSeconds = Math.min(safeSeconds, maxTime);
     const frameIndex = Math.min(
       format.count - 1,
-      Math.max(0, Math.floor((boundedSeconds * 1000) / format.intervalMs))
+      Math.max(0, Math.floor((boundedSeconds / maxTime) * format.count))
     );
-    const framesPerSheet = format.columns * format.rows;
+    const framesPerSheet = format.framesPerSprite || format.columns * format.rows;
     const sheetIndex = Math.floor(frameIndex / framesPerSheet);
     const tileIndex = frameIndex % framesPerSheet;
-    const queryValue = format.signature || format.name || 'default';
     const rawUrl = storyboard.template
       .replace(/\$L/g, String(format.level))
-      .replace(/\$N/g, String(sheetIndex))
-      .replace(/\$M/g, queryValue);
+      .replace(/\$N/g, String(format.name))
+      .replace(/\$M/g, String(sheetIndex));
 
     let url;
     try {
@@ -276,6 +479,7 @@
       if (parsedUrl.protocol !== 'https:' || parsedUrl.origin !== STORYBOARD_ORIGIN) {
         return null;
       }
+      parsedUrl.searchParams.set('sigh', format.signature || '');
       url = parsedUrl.href;
     } catch (error) {
       return null;
@@ -289,6 +493,11 @@
       height: format.height,
       sheetWidth: format.width * format.columns,
       sheetHeight: format.height * format.rows,
+      frameIndex: frameIndex,
+      spriteIndex: sheetIndex,
+      cellIndex: tileIndex,
+      framesPerSprite: framesPerSheet,
+      spriteCount: format.spriteCount || Math.ceil(format.count / framesPerSheet),
       seconds: boundedSeconds
     };
   }
@@ -328,7 +537,7 @@
       translationLanguages: translationLanguages,
       videoId: responseVideoId,
       duration: duration,
-      storyboard: normalizeStoryboard(storyboardRenderer, responseVideoId)
+      storyboard: normalizeStoryboard(storyboardRenderer, responseVideoId, duration)
     };
   }
 
@@ -347,8 +556,8 @@
       : [];
 
     const translationLanguages = normalizeTranslationLanguages(catalog.translationLanguages);
-    const storyboard = normalizeStoryboard(catalog.storyboard, normalizedVideoId);
     const duration = normalizeDuration(catalog.duration);
+    const storyboard = normalizeStoryboard(catalog.storyboard, normalizedVideoId, duration);
 
     return {
       available: catalog.available === true || tracks.length > 0,
@@ -493,6 +702,22 @@
     normalizeVideoId: normalizeVideoId,
     normalizeLanguage: normalizeLanguage,
     normalizeDuration: normalizeDuration,
+    normalizeCaptionLines: normalizeCaptionLines,
+    normalizeCaptionState: normalizeCaptionState,
+    resolveCaptionEnabledState: resolveCaptionEnabledState,
+    getCaptionTogglePlan: getCaptionTogglePlan,
+    isCaptionButtonPressed: isCaptionButtonPressed,
+    clampSeekTime: clampSeekTime,
+    getSeekDisplayTime: getSeekDisplayTime,
+    isSeekWithinTolerance: isSeekWithinTolerance,
+    isSeekNoOp: isSeekNoOp,
+    getSeekCommitPlan: getSeekCommitPlan,
+    isTimeBuffered: isTimeBuffered,
+    selectCaptionWindowGeneration: selectCaptionWindowGeneration,
+    isSeekRequestCurrent: isSeekRequestCurrent,
+    getSeekController: getSeekController,
+    isStoryboardFrameCurrent: isStoryboardFrameCurrent,
+    canApplyStoryboardFrame: canApplyStoryboardFrame,
     getSafeCaptionUrl: getSafeCaptionUrl,
     buildCaptionCatalog: buildCaptionCatalog,
     extractJsonObject: extractJsonObject,
@@ -500,6 +725,7 @@
     parseXmlCaptionCues: parseXmlCaptionCues,
     normalizeCaptionTrack: normalizeCaptionTrack,
     sanitizeCaptionCatalog: sanitizeCaptionCatalog,
+    getSafeStoryboardTemplate: getSafeStoryboardTemplate,
     normalizeStoryboard: normalizeStoryboard,
     getStoryboardFrame: getStoryboardFrame
   });

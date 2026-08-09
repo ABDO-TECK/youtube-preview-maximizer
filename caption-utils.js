@@ -176,8 +176,132 @@
         end >= start &&
         end - start >= safeMargin * 2 &&
         target >= start + safeMargin &&
-        target <= end - safeMargin;
+      target <= end - safeMargin;
     });
+  }
+
+  function getSeekConfirmationPlan(
+    playerControlled,
+    playerCurrentTime,
+    videoCurrentTime,
+    requestedTime,
+    tolerance
+  ) {
+    const playerConfirmed = isSeekWithinTolerance(
+      playerCurrentTime,
+      requestedTime,
+      tolerance
+    );
+    const videoConfirmed = isSeekWithinTolerance(
+      videoCurrentTime,
+      requestedTime,
+      tolerance
+    );
+    const videoAvailable = videoCurrentTime !== null &&
+      videoCurrentTime !== undefined;
+    return {
+      playerConfirmed: playerConfirmed,
+      videoConfirmed: videoConfirmed,
+      confirmed: playerControlled === true
+        ? playerConfirmed && (!videoAvailable || videoConfirmed)
+        : videoAvailable
+          ? videoConfirmed
+          : playerConfirmed
+    };
+  }
+
+  function getSeekExecutionPlan(targetBuffered, playerSeekAvailable) {
+    if (playerSeekAvailable !== true) {
+      return [{ stage: 'video-fallback', allowSeekAhead: null }];
+    }
+
+    if (targetBuffered === true) {
+      return [{ stage: 'buffered-player-seek', allowSeekAhead: false }];
+    }
+
+    return [
+      { stage: 'unbuffered-load-seek', allowSeekAhead: true },
+      { stage: 'precision-player-seek', allowSeekAhead: false }
+    ];
+  }
+
+  function getCaptionMutationOwnershipPlan(mutations) {
+    const contentTouched = [];
+    const activationTouched = [];
+    const removedWindows = [];
+    const pushUnique = function (collection, value) {
+      if (value !== null && value !== undefined && !collection.includes(value)) {
+        collection.push(value);
+      }
+    };
+    const collectNodeWindows = function (nodes, fallback) {
+      const values = [];
+      (Array.isArray(nodes) ? nodes : []).forEach(function (node) {
+        if (node && typeof node === 'object' && !Array.isArray(node)) {
+          if (node.window !== undefined) {
+            pushUnique(values, node.window);
+          }
+          if (node.captionWindow !== undefined) {
+            pushUnique(values, node.captionWindow);
+          }
+          (Array.isArray(node.windows) ? node.windows : [])
+            .forEach(function (captionWindow) {
+              pushUnique(values, captionWindow);
+            });
+          (Array.isArray(node.descendants) ? node.descendants : [])
+            .forEach(function (captionWindow) {
+              pushUnique(values, captionWindow);
+            });
+          return;
+        }
+        pushUnique(values, node);
+      });
+      if (!values.length) {
+        (Array.isArray(fallback) ? fallback : []).forEach(function (captionWindow) {
+          pushUnique(values, captionWindow);
+        });
+      }
+      return values;
+    };
+
+    (Array.isArray(mutations) ? mutations : []).forEach(function (mutation) {
+      if (!mutation || typeof mutation !== 'object') {
+        return;
+      }
+
+      if (mutation.type === 'childList') {
+        pushUnique(contentTouched, mutation.targetWindow);
+        collectNodeWindows(mutation.addedNodes, mutation.addedWindows)
+          .forEach(function (captionWindow) {
+            pushUnique(contentTouched, captionWindow);
+          });
+        collectNodeWindows(mutation.removedNodes, mutation.removedWindows)
+          .forEach(function (captionWindow) {
+            pushUnique(removedWindows, captionWindow);
+          });
+        return;
+      }
+
+      if (mutation.type === 'characterData') {
+        pushUnique(contentTouched, mutation.targetWindow);
+        return;
+      }
+
+      if (mutation.type === 'attributes' && mutation.attributeName === 'aria-hidden') {
+        pushUnique(
+          activationTouched,
+          mutation.activationWindow !== undefined
+            ? mutation.activationWindow
+            : mutation.targetWindow
+        );
+      }
+    });
+
+    return {
+      contentTouched: contentTouched,
+      activationTouched: activationTouched,
+      removedWindows: removedWindows
+    };
   }
 
   function selectCaptionWindowGeneration(previousActiveWindows, touchedWindows, currentWindows) {
@@ -713,6 +837,9 @@
     isSeekNoOp: isSeekNoOp,
     getSeekCommitPlan: getSeekCommitPlan,
     isTimeBuffered: isTimeBuffered,
+    getSeekConfirmationPlan: getSeekConfirmationPlan,
+    getSeekExecutionPlan: getSeekExecutionPlan,
+    getCaptionMutationOwnershipPlan: getCaptionMutationOwnershipPlan,
     selectCaptionWindowGeneration: selectCaptionWindowGeneration,
     isSeekRequestCurrent: isSeekRequestCurrent,
     getSeekController: getSeekController,

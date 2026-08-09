@@ -137,6 +137,45 @@ test('keeps seek UI pending until one authoritative commit is confirmed', () => 
   assert.equal(utils.isSeekWithinTolerance(130, 138, 0.75), false);
   assert.equal(utils.isSeekWithinTolerance(15.85, 16, 0.5), true);
   assert.equal(utils.isSeekWithinTolerance(13, 16, 0.5), false);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(utils.getSeekConfirmationPlan(true, 13, 16, 16, 0.5))),
+    {
+      playerConfirmed: false,
+      videoConfirmed: true,
+      confirmed: false
+    }
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(utils.getSeekConfirmationPlan(true, 16, 15.8, 16, 0.5))),
+    {
+      playerConfirmed: true,
+      videoConfirmed: true,
+      confirmed: true
+    }
+  );
+  assert.equal(
+    utils.getSeekConfirmationPlan(true, 16, 13, 16, 0.5).confirmed,
+    false
+  );
+  assert.equal(
+    utils.getSeekConfirmationPlan(false, null, 16, 16, 0.5).confirmed,
+    true
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(utils.getSeekExecutionPlan(true, true))),
+    [{ stage: 'buffered-player-seek', allowSeekAhead: false }]
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(utils.getSeekExecutionPlan(false, true))),
+    [
+      { stage: 'unbuffered-load-seek', allowSeekAhead: true },
+      { stage: 'precision-player-seek', allowSeekAhead: false }
+    ]
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(utils.getSeekExecutionPlan(false, false))),
+    [{ stage: 'video-fallback', allowSeekAhead: null }]
+  );
 
   assert.equal(utils.getSeekCommitPlan(13, 16, 300, 0.15).shouldSeek, true);
   assert.equal(utils.getSeekCommitPlan(13, 18, 300, 0.15).shouldSeek, true);
@@ -173,6 +212,94 @@ test('selects caption windows by mutation generation without losing multiline cu
   assert.deepEqual(
     JSON.parse(JSON.stringify(utils.selectCaptionWindowGeneration(active, [], ['A', 'B']))),
     []
+  );
+});
+
+test('assigns caption mutations to their owning window and prioritizes the current generation', () => {
+  const rendererNode = {
+    kind: 'caption-renderer',
+    descendantWindows: ['window-A', 'window-B']
+  };
+  const rendererTargetBatch = utils.getCaptionMutationOwnershipPlan([
+    {
+      type: 'childList',
+      target: rendererNode,
+      targetWindow: null,
+      addedNodes: [{
+        captionWindow: 'window-B',
+        descendants: []
+      }],
+      removedNodes: []
+    }
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(rendererTargetBatch)), {
+    contentTouched: ['window-B'],
+    activationTouched: [],
+    removedWindows: []
+  });
+
+  const internalSegmentBatch = utils.getCaptionMutationOwnershipPlan([
+    {
+      type: 'characterData',
+      targetWindow: 'window-B'
+    }
+  ]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(internalSegmentBatch.contentTouched)),
+    ['window-B']
+  );
+
+  const activationBatch = utils.getCaptionMutationOwnershipPlan([
+    {
+      type: 'attributes',
+      attributeName: 'aria-hidden',
+      activationWindow: 'window-B'
+    }
+  ]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(activationBatch.activationTouched)),
+    ['window-B']
+  );
+  const removalBatch = utils.getCaptionMutationOwnershipPlan([
+    {
+      type: 'childList',
+      target: rendererNode,
+      targetWindow: null,
+      addedNodes: [],
+      removedNodes: [{ captionWindow: 'window-B', descendants: [] }]
+    }
+  ]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(removalBatch.removedWindows)),
+    ['window-B']
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(utils.selectCaptionWindowGeneration(
+      ['window-A'],
+      activationBatch.activationTouched,
+      ['window-A', 'window-B']
+    ))),
+    ['window-B']
+  );
+
+  const arabicOldWindow = { id: 'A', text: '\u0645\u0631\u062d\u0628\u0627' };
+  const arabicNewWindow = { id: 'B', text: '\u0627\u0644\u0639\u0627\u0644\u0645' };
+  const arabicTransition = utils.getCaptionMutationOwnershipPlan([
+    {
+      type: 'childList',
+      target: rendererNode,
+      targetWindow: null,
+      addedNodes: [{ captionWindow: arabicNewWindow, descendants: [] }],
+      removedNodes: []
+    }
+  ]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(utils.selectCaptionWindowGeneration(
+      [arabicOldWindow],
+      arabicTransition.contentTouched,
+      [arabicOldWindow, arabicNewWindow]
+    ))),
+    [arabicNewWindow]
   );
 });
 

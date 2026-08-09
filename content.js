@@ -1910,7 +1910,9 @@
 
     const captionWindows = getCaptionWindows(renderer);
     const hasGeneration = Boolean(
-      state && state.captionActiveWindows && state.captionActiveWindows.size
+      state &&
+      state.captionGeneration > 0 &&
+      state.captionActiveWindows
     );
     const activeWindows = hasGeneration
       ? Array.from(state.captionActiveWindows).filter(function (captionWindow) {
@@ -1999,35 +2001,135 @@
     }, 0);
   }
 
-  function collectCaptionWindowsFromNode(node, renderer, collection, allowDetached) {
+  function isCaptionWindowInRenderer(captionWindow, renderer, allowDetached) {
+    return Boolean(
+      captionWindow &&
+      (allowDetached || captionWindow === renderer || renderer.contains(captionWindow))
+    );
+  }
+
+  function getCaptionWindowOwnerFromNode(node, renderer, allowDetached) {
+    if (!node) {
+      return null;
+    }
+
+    const element = node.nodeType === 1 ? node : node.parentElement;
+    if (!element) {
+      return null;
+    }
+
+    const owner = element.matches && element.matches('.caption-window')
+      ? element
+      : element.closest && element.closest('.caption-window');
+    return isCaptionWindowInRenderer(owner, renderer, allowDetached)
+      ? owner
+      : null;
+  }
+
+  function collectCaptionWindowsFromAddedNode(node, renderer, collection, allowDetached) {
     if (!node) {
       return;
     }
 
-    const element = node.nodeType === 1 ? node : node.parentElement;
-    if (element) {
-      const owner = element.matches && element.matches('.caption-window')
-        ? element
-        : element.closest && element.closest('.caption-window');
-      if (owner && (allowDetached || renderer.contains(owner))) {
-        collection.add(owner);
-      }
-      if (element.querySelectorAll) {
-        element.querySelectorAll('.caption-window').forEach(function (captionWindow) {
-          if (allowDetached || renderer.contains(captionWindow)) {
-            collection.add(captionWindow);
-          }
-        });
-      }
+    if (node.nodeType === 1 && node.matches && node.matches('.caption-window') &&
+      isCaptionWindowInRenderer(node, renderer, allowDetached)) {
+      collection.add(node);
+    }
+    if (!node.querySelectorAll) {
+      return;
     }
 
-    if (node.querySelectorAll) {
-      node.querySelectorAll('.caption-window').forEach(function (captionWindow) {
-        if (allowDetached || renderer.contains(captionWindow)) {
-          collection.add(captionWindow);
-        }
-      });
+    node.querySelectorAll('.caption-window').forEach(function (captionWindow) {
+      if (isCaptionWindowInRenderer(captionWindow, renderer, allowDetached)) {
+        collection.add(captionWindow);
+      }
+    });
+  }
+
+  function getCaptionMutationOwnershipPlan(mutations, renderer) {
+    const normalizedMutations = [];
+
+    mutations.forEach(function (mutation) {
+      if (mutation.type === 'childList') {
+        const addedWindows = new Set();
+        const removedWindows = new Set();
+        Array.from(mutation.addedNodes || []).forEach(function (node) {
+          collectCaptionWindowsFromAddedNode(node, renderer, addedWindows, false);
+        });
+        Array.from(mutation.removedNodes || []).forEach(function (node) {
+          collectCaptionWindowsFromAddedNode(node, renderer, removedWindows, true);
+        });
+        normalizedMutations.push({
+          type: mutation.type,
+          targetWindow: getCaptionWindowOwnerFromNode(
+            mutation.target,
+            renderer,
+            false
+          ),
+          addedNodes: [{ windows: Array.from(addedWindows) }],
+          removedNodes: [{ windows: Array.from(removedWindows) }]
+        });
+        return;
+      }
+
+      if (mutation.type === 'characterData') {
+        normalizedMutations.push({
+          type: mutation.type,
+          targetWindow: getCaptionWindowOwnerFromNode(
+            mutation.target,
+            renderer,
+            false
+          )
+        });
+        return;
+      }
+
+      if (mutation.type === 'attributes' && mutation.attributeName === 'aria-hidden') {
+        const activationWindow = getCaptionWindowOwnerFromNode(
+          mutation.target,
+          renderer,
+          false
+        );
+        normalizedMutations.push({
+          type: mutation.type,
+          attributeName: mutation.attributeName,
+          activationWindow: activationWindow,
+          targetWindow: activationWindow
+        });
+      }
+    });
+
+    if (captionUtils.getCaptionMutationOwnershipPlan) {
+      return captionUtils.getCaptionMutationOwnershipPlan(normalizedMutations);
     }
+
+    const contentTouched = new Set();
+    const activationTouched = new Set();
+    const removedWindows = new Set();
+    normalizedMutations.forEach(function (mutation) {
+      if (mutation.targetWindow) {
+        if (mutation.type === 'attributes') {
+          activationTouched.add(mutation.targetWindow);
+        } else {
+          contentTouched.add(mutation.targetWindow);
+        }
+      }
+      Array.from(mutation.addedNodes || []).forEach(function (node) {
+        Array.from(node.windows || []).forEach(function (captionWindow) {
+          contentTouched.add(captionWindow);
+        });
+      });
+      Array.from(mutation.removedNodes || []).forEach(function (node) {
+        Array.from(node.windows || []).forEach(function (captionWindow) {
+          removedWindows.add(captionWindow);
+        });
+      });
+    });
+    return {
+      contentTouched: Array.from(contentTouched),
+      activationTouched: Array.from(activationTouched),
+      removedWindows: Array.from(removedWindows)
+    };
   }
 
   function handleCaptionMutationBatch(state, renderer, mutations) {
@@ -2035,31 +2137,10 @@
       return;
     }
 
-    const contentTouched = new Set();
-    const activationTouched = new Set();
-    const removedWindows = new Set();
-
-    mutations.forEach(function (mutation) {
-      if (mutation.type === 'childList') {
-        collectCaptionWindowsFromNode(mutation.target, renderer, contentTouched, false);
-        Array.from(mutation.addedNodes || []).forEach(function (node) {
-          collectCaptionWindowsFromNode(node, renderer, contentTouched, false);
-        });
-        Array.from(mutation.removedNodes || []).forEach(function (node) {
-          collectCaptionWindowsFromNode(node, renderer, removedWindows, true);
-        });
-        return;
-      }
-
-      if (mutation.type === 'characterData') {
-        collectCaptionWindowsFromNode(mutation.target, renderer, contentTouched, false);
-        return;
-      }
-
-      if (mutation.type === 'attributes' && mutation.attributeName === 'aria-hidden') {
-        collectCaptionWindowsFromNode(mutation.target, renderer, activationTouched, false);
-      }
-    });
+    const ownershipPlan = getCaptionMutationOwnershipPlan(mutations, renderer);
+    const contentTouched = new Set(ownershipPlan.contentTouched);
+    const activationTouched = new Set(ownershipPlan.activationTouched);
+    const removedWindows = new Set(ownershipPlan.removedWindows);
 
     const currentWindows = getCaptionWindows(renderer);
     const previousActiveWindows = Array.from(state.captionActiveWindows || [])
@@ -2068,9 +2149,9 @@
       });
     const touchedWindows = contentTouched.size
       ? Array.from(contentTouched)
-      : previousActiveWindows.length
-        ? previousActiveWindows
-        : Array.from(activationTouched);
+      : activationTouched.size
+        ? Array.from(activationTouched)
+        : previousActiveWindows;
     const activeWindows = captionUtils.selectCaptionWindowGeneration
       ? captionUtils.selectCaptionWindowGeneration(
         previousActiveWindows,
@@ -2099,19 +2180,22 @@
         generation: state.captionWindowGenerations.get(captionWindow) || 0
       };
     });
+    const getWindowIndexes = function (windows) {
+      return windows.map(function (captionWindow) {
+        return currentWindows.indexOf(captionWindow);
+      }).filter(function (index) {
+        return index >= 0;
+      });
+    };
     const batchDebug = {
       generation: state.captionGeneration,
       mutationCount: mutations.length,
-      touchedWindows: touchedWindows.map(function (captionWindow) {
-        return currentWindows.indexOf(captionWindow);
-      }).filter(function (index) {
-        return index >= 0;
-      }),
-      activeWindows: activeWindows.map(function (captionWindow) {
-        return currentWindows.indexOf(captionWindow);
-      }).filter(function (index) {
-        return index >= 0;
-      }),
+      contentTouched: getWindowIndexes(Array.from(contentTouched)),
+      activationTouched: getWindowIndexes(Array.from(activationTouched)),
+      previousActiveWindows: getWindowIndexes(previousActiveWindows),
+      removedWindows: getWindowIndexes(Array.from(removedWindows)),
+      touchedWindows: getWindowIndexes(touchedWindows),
+      activeWindows: getWindowIndexes(activeWindows),
       windowDebug: windowDebug,
       finalMirroredLines: 0
     };
@@ -3532,6 +3616,196 @@
     }
   }
 
+  function getSeekConfirmationStatus(state, request, snapshot) {
+    const current = snapshot || getSeekSnapshot(state);
+    if (captionUtils.getSeekConfirmationPlan) {
+      return captionUtils.getSeekConfirmationPlan(
+        request.playerControlled === true,
+        current.playerCurrentTime,
+        current.videoCurrentTime,
+        request.targetTime,
+        SEEK_CONFIRM_TOLERANCE
+      );
+    }
+
+    const playerConfirmed = isSeekWithinToleranceValue(
+      current.playerCurrentTime,
+      request.targetTime,
+      SEEK_CONFIRM_TOLERANCE
+    );
+    const videoConfirmed = isSeekWithinToleranceValue(
+      current.videoCurrentTime,
+      request.targetTime,
+      SEEK_CONFIRM_TOLERANCE
+    );
+    const videoAvailable = current.videoCurrentTime !== null;
+    return {
+      playerConfirmed: playerConfirmed,
+      videoConfirmed: videoConfirmed,
+      confirmed: request.playerControlled === true
+        ? playerConfirmed && (!videoAvailable || videoConfirmed)
+        : videoAvailable
+          ? videoConfirmed
+          : playerConfirmed
+    };
+  }
+
+  function getSeekDebugDetails(state, request, snapshot, details) {
+    const current = snapshot || getSeekSnapshot(state);
+    const confirmation = getSeekConfirmationStatus(state, request, current);
+    const bridgeResult = request.bridgeResult;
+    const playerStateKnown = request.seekCallCount > 0;
+    const output = {
+      rangeValue: request.rangeValue,
+      requestedTime: request.targetTime,
+      targetTime: request.targetTime,
+      buffered: request.targetBuffered === true,
+      playerFound: playerStateKnown
+        ? request.playerFound === true
+        : request.playerFound === true ||
+          Boolean(bridgeResult && bridgeResult.playerFound === true) ||
+          current.playerFound,
+      playerSeekToAvailable: playerStateKnown
+        ? request.playerSeekToAvailable === true
+        : request.playerSeekToAvailable === true ||
+          Boolean(bridgeResult && bridgeResult.seekToAvailable === true) ||
+          current.playerSeekToAvailable,
+      stage: request.stage || 'pending',
+      allowSeekAhead: typeof request.allowSeekAhead === 'boolean'
+        ? request.allowSeekAhead
+        : null,
+      videoCurrentTimeBefore: request.before.videoCurrentTime,
+      videoCurrentTimeAfter: current.videoCurrentTime,
+      playerCurrentTimeBefore: request.before.playerCurrentTime,
+      playerCurrentTimeAfter: current.playerCurrentTime,
+      videoDuration: current.videoDuration,
+      metadataDuration: current.metadataDuration,
+      bufferedRanges: current.bufferedRanges,
+      requestId: request.requestId,
+      controller: request.controller,
+      playerConfirmed: confirmation.playerConfirmed,
+      videoConfirmed: confirmation.videoConfirmed,
+      confirmed: confirmation.confirmed,
+      pendingCleared: state.seekPending === false,
+      timeout: false,
+      snapbackDetected: false
+    };
+    return Object.assign(output, details || {});
+  }
+
+  function isPlayerSeekUsable(result) {
+    return Boolean(result && result.ok === true && result.seekToAvailable === true);
+  }
+
+  function canFallbackToVideoSeek(result) {
+    return !result || result.playerFound !== true || result.seekToAvailable !== true;
+  }
+
+  function invokeDirectPlayerSeek(state, request, allowSeekAhead, stage) {
+    if (!state.playerApi) {
+      state.playerApi = getYoutubePlayerApi(state.video);
+    }
+    if (!state.playerApi || typeof state.playerApi.seekTo !== 'function') {
+      return null;
+    }
+
+    const playerCurrentTimeBefore = readPlayerCurrentTime(state);
+    try {
+      state.playerApi.seekTo(request.targetTime, allowSeekAhead === true);
+      return {
+        ok: true,
+        available: true,
+        playerFound: true,
+        seekToAvailable: true,
+        targetTime: request.targetTime,
+        playerCurrentTimeBefore: playerCurrentTimeBefore,
+        playerCurrentTimeAfter: readPlayerCurrentTime(state),
+        direct: true,
+        stage: stage
+      };
+    } catch (error) {
+      reportError('seek-player-direct', error);
+      return {
+        ok: false,
+        available: true,
+        playerFound: true,
+        seekToAvailable: true,
+        targetTime: request.targetTime,
+        playerCurrentTimeBefore: playerCurrentTimeBefore,
+        playerCurrentTimeAfter: readPlayerCurrentTime(state),
+        direct: true,
+        stage: stage
+      };
+    }
+  }
+
+  function requestPlayerSeek(state, request, allowSeekAhead, stage) {
+    request.stage = stage;
+    request.allowSeekAhead = allowSeekAhead === true;
+    const payload = {
+      videoId: state.videoId,
+      seconds: request.targetTime,
+      allowSeekAhead: request.allowSeekAhead
+    };
+
+    debugLog('Seek', 'playerSeekRequest', getSeekDebugDetails(
+      state,
+      request,
+      getSeekSnapshot(state),
+      {
+        bridgeOk: false,
+        seekCallIndex: request.seekCallCount + 1
+      }
+    ));
+
+    return requestPageBridge('seek-preview', payload, PAGE_BRIDGE_TIMEOUT_MS)
+      .catch(function (error) {
+        reportError('seek-bridge', error);
+        return null;
+      })
+      .then(function (result) {
+        if (!isCurrentSeekRequest(state, request.requestId)) {
+          return null;
+        }
+        if (!result || result.playerFound !== true ||
+          result.seekToAvailable !== true) {
+          const directResult = invokeDirectPlayerSeek(
+            state,
+            request,
+            allowSeekAhead,
+            stage
+          );
+          if (directResult) {
+            result = directResult;
+          }
+        }
+
+        request.seekCallCount += 1;
+        request.bridgeResult = result;
+        request.playerFound = Boolean(result && result.playerFound === true);
+        request.playerSeekToAvailable = Boolean(
+          result && result.seekToAvailable === true
+        );
+        const after = getSeekSnapshot(state);
+        debugLog('Seek', 'playerSeekResult', getSeekDebugDetails(
+          state,
+          request,
+          after,
+          {
+            bridgeOk: Boolean(result && result.ok === true),
+            seekCallIndex: request.seekCallCount,
+            bridgePlayerCurrentTimeBefore: result
+              ? result.playerCurrentTimeBefore
+              : null,
+            bridgePlayerCurrentTimeAfter: result
+              ? result.playerCurrentTimeAfter
+              : null
+          }
+        ));
+        return result;
+      });
+  }
+
   function restoreSeekPlaybackState(state, wasPaused) {
     if (wasPaused) {
       if (!state.video.paused) {
@@ -3552,53 +3826,29 @@
 
     clearSeekConfirmationTimer(state);
     const after = getSeekSnapshot(state);
-    const videoConfirmed = isSeekWithinToleranceValue(
-      after.videoCurrentTime,
-      request.targetTime,
-      SEEK_CONFIRM_TOLERANCE
-    );
-    const playerConfirmed = isSeekWithinToleranceValue(
-      after.playerCurrentTime,
-      request.targetTime,
-      SEEK_CONFIRM_TOLERANCE
-    );
-    const finalConfirmed = after.videoCurrentTime !== null
-      ? videoConfirmed
-      : playerConfirmed;
+    const confirmation = getSeekConfirmationStatus(state, request, after);
+    const finalConfirmed = confirmation.confirmed;
     const snapbackDetected = !finalConfirmed && (
-      after.videoCurrentTime !== null
-        ? !videoConfirmed
-        : after.playerCurrentTime !== null && !playerConfirmed
+      (after.videoCurrentTime !== null && !confirmation.videoConfirmed) ||
+      (request.playerControlled === true &&
+        after.playerCurrentTime !== null && !confirmation.playerConfirmed)
     );
-
-    debugLog('Seek', 'confirmation', {
-      rangeValue: request.rangeValue,
-      requestedTime: request.targetTime,
-      videoCurrentTimeBefore: request.before.videoCurrentTime,
-      videoCurrentTimeAfter: after.videoCurrentTime,
-      playerFound: request.bridgeResult && request.bridgeResult.playerFound === true
-        ? true
-        : after.playerFound,
-      playerSeekToAvailable: request.bridgeResult &&
-        request.bridgeResult.seekToAvailable === true
-        ? true
-        : after.playerSeekToAvailable,
-      playerCurrentTimeBefore: request.before.playerCurrentTime,
-      playerCurrentTimeAfter: after.playerCurrentTime,
-      videoDuration: after.videoDuration,
-      metadataDuration: after.metadataDuration,
-      bufferedRanges: after.bufferedRanges,
-      requestId: request.requestId,
-      controller: request.controller,
-      confirmed: finalConfirmed,
-      reason: reason,
-      snapbackDetected: snapbackDetected
-    });
-
     state.seekPending = false;
     state.seekDragging = false;
     state.pendingSeekTime = null;
     state.seekConfirmationCheck = null;
+    debugLog('Seek', 'confirmation', getSeekDebugDetails(
+      state,
+      request,
+      after,
+      {
+        confirmed: finalConfirmed,
+        reason: reason,
+        pendingCleared: true,
+        timeout: /timeout$/.test(String(reason || '')),
+        snapbackDetected: snapbackDetected
+      }
+    ));
     scheduleVideoControlUpdate(state);
 
     if (finalConfirmed && request.restorePlayback !== false) {
@@ -3606,44 +3856,32 @@
     }
   }
 
-  function applySeekPrecisionCorrection(state, request, reason) {
-    if (request.precisionCorrectionApplied) {
-      return true;
+  function applyVideoFallbackSeek(state, request, reason) {
+    if (request.videoFallbackIssued) {
+      return request.videoFallbackApplied === true;
+    }
+    if (request.playerControlled === true) {
+      return false;
     }
 
+    request.videoFallbackIssued = true;
     const applied = setVideoPropertySafely(
       state,
       'currentTime',
       request.targetTime
     );
-    if (applied) {
-      request.precisionCorrectionApplied = true;
-    }
-    debugLog('Seek', 'precisionCorrection', {
-      rangeValue: request.rangeValue,
-      requestedTime: request.targetTime,
-      videoCurrentTimeBefore: request.before.videoCurrentTime,
-      videoCurrentTimeAfter: readVideoCurrentTime(state),
-      playerFound: Boolean(state.playerApi),
-      playerSeekToAvailable: Boolean(
-        state.playerApi && typeof state.playerApi.seekTo === 'function'
-      ),
-      playerCurrentTimeBefore: request.before.playerCurrentTime,
-      playerCurrentTimeAfter: readPlayerCurrentTime(state),
-      videoDuration: Number.isFinite(Number(state.video.duration))
-        ? Number(state.video.duration)
-        : null,
-      metadataDuration: Number.isFinite(Number(state.duration))
-        ? Number(state.duration)
-        : null,
-      bufferedRanges: readBufferedRanges(state.video),
-      requestId: request.requestId,
-      confirmed: false,
-      snapbackDetected: false,
-      correctionReason: reason,
-      precisionCorrectionApplied: request.precisionCorrectionApplied,
-      applied: applied
-    });
+    request.videoFallbackApplied = applied;
+    debugLog('Seek', 'videoFallback', getSeekDebugDetails(
+      state,
+      request,
+      getSeekSnapshot(state),
+      {
+        correctionReason: reason,
+        applied: applied,
+        videoFallbackIssued: request.videoFallbackIssued,
+        pendingCleared: false
+      }
+    ));
     return applied;
   }
 
@@ -3657,19 +3895,22 @@
       clearSeekConfirmationTimer(state);
 
       const current = getSeekSnapshot(state);
-      const videoConfirmed = isSeekWithinToleranceValue(
-        current.videoCurrentTime,
-        request.targetTime,
-        SEEK_CONFIRM_TOLERANCE
-      );
-      const playerConfirmed = isSeekWithinToleranceValue(
-        current.playerCurrentTime,
-        request.targetTime,
-        SEEK_CONFIRM_TOLERANCE
-      );
-      const currentConfirmed = current.videoCurrentTime !== null
-        ? videoConfirmed
-        : playerConfirmed;
+      const confirmation = getSeekConfirmationStatus(state, request, current);
+      const currentConfirmed = confirmation.confirmed;
+      debugLog('Seek', 'confirmationPoll', getSeekDebugDetails(
+        state,
+        request,
+        current,
+        {
+          pendingCleared: false,
+          timeout: false,
+          snapbackDetected: !currentConfirmed && (
+            (current.videoCurrentTime !== null && !confirmation.videoConfirmed) ||
+            (request.playerControlled === true &&
+              current.playerCurrentTime !== null && !confirmation.playerConfirmed)
+          )
+        }
+      ));
       if (currentConfirmed || Date.now() >= deadline) {
         finishSeekRequest(
           state,
@@ -3702,38 +3943,72 @@
         snapshot.bufferedRanges,
         request.targetTime
       );
-      debugLog('Seek', 'precisionStage', {
-        rangeValue: request.rangeValue,
-        requestedTime: request.targetTime,
-        videoCurrentTimeBefore: request.before.videoCurrentTime,
-        videoCurrentTimeAfter: snapshot.videoCurrentTime,
-        playerFound: request.bridgeResult && request.bridgeResult.playerFound === true
-          ? true
-          : snapshot.playerFound,
-        playerSeekToAvailable: request.bridgeResult &&
-          request.bridgeResult.seekToAvailable === true
-          ? true
-          : snapshot.playerSeekToAvailable,
-        playerCurrentTimeBefore: request.before.playerCurrentTime,
-        playerCurrentTimeAfter: snapshot.playerCurrentTime,
-        videoDuration: snapshot.videoDuration,
-        metadataDuration: snapshot.metadataDuration,
-        bufferedRanges: snapshot.bufferedRanges,
-        requestId: request.requestId,
-        confirmed: false,
-        snapbackDetected: false,
-        targetBuffered: targetBuffered,
-        precisionCorrectionApplied: request.precisionCorrectionApplied,
-        controller: request.controller
-      });
+      debugLog('Seek', 'precisionStage', getSeekDebugDetails(
+        state,
+        request,
+        snapshot,
+        {
+          buffered: targetBuffered,
+          targetBuffered: targetBuffered,
+          precisionSeekIssued: request.precisionSeekIssued,
+          pendingCleared: false
+        }
+      ));
 
       if (targetBuffered) {
-        request.controller = 'player-load+video-precision';
-        if (!applySeekPrecisionCorrection(state, request, 'target-buffered')) {
-          finishSeekRequest(state, request, false, 'precision-apply-failed');
+        if (request.precisionSeekIssued) {
           return;
         }
-        confirmSeekRequest(state, request);
+        request.precisionSeekIssued = true;
+        request.controller = 'player-precision';
+        const precisionPlan = captionUtils.getSeekExecutionPlan
+          ? captionUtils.getSeekExecutionPlan(false, true)[1]
+          : { stage: 'precision-player-seek', allowSeekAhead: false };
+        requestPlayerSeek(
+          state,
+          request,
+          precisionPlan.allowSeekAhead,
+          precisionPlan.stage
+        )
+          .then(function (result) {
+            if (!isCurrentSeekRequest(state, request.requestId)) {
+              return;
+            }
+
+            if (!isPlayerSeekUsable(result)) {
+              finishSeekRequest(
+                state,
+                request,
+                false,
+                result && result.playerFound === true &&
+                  result.seekToAvailable === true
+                  ? 'precision-player-seek-failed'
+                  : 'precision-player-unavailable'
+              );
+              return;
+            }
+
+            request.precisionCorrectionApplied = true;
+            debugLog('Seek', 'precisionCommit', getSeekDebugDetails(
+              state,
+              request,
+              getSeekSnapshot(state),
+              {
+                bridgeOk: true,
+                precisionSeekIssued: request.precisionSeekIssued,
+                precisionCorrectionApplied: request.precisionCorrectionApplied,
+                pendingCleared: false
+              }
+            ));
+            confirmSeekRequest(state, request);
+          })
+          .catch(function (error) {
+            if (!isCurrentSeekRequest(state, request.requestId)) {
+              return;
+            }
+            reportError('seek-precision-player', error);
+            finishSeekRequest(state, request, false, 'precision-player-error');
+          });
         return;
       }
 
@@ -3792,9 +4067,19 @@
       targetTime: targetTime,
       before: before,
       wasPaused: wasPaused,
-      controller: 'video',
+      controller: 'pending',
       bridgeResult: null,
+      playerControlled: false,
+      playerFound: before.playerFound,
+      playerSeekToAvailable: before.playerSeekToAvailable,
+      seekCallCount: 0,
+      targetBuffered: isTimeBufferedValue(before.bufferedRanges, targetTime),
+      stage: 'pending',
+      allowSeekAhead: null,
+      precisionSeekIssued: false,
       precisionCorrectionApplied: false,
+      videoFallbackIssued: false,
+      videoFallbackApplied: false,
       restorePlayback: true
     };
 
@@ -3806,109 +4091,91 @@
       return true;
     }
 
-    debugLog('Seek', 'request', {
-      rangeValue: request.rangeValue,
-      requestedTime: request.targetTime,
-      videoCurrentTimeBefore: before.videoCurrentTime,
-      videoCurrentTimeAfter: null,
-      playerFound: before.playerFound,
-      playerSeekToAvailable: before.playerSeekToAvailable,
-      playerCurrentTimeBefore: before.playerCurrentTime,
-      playerCurrentTimeAfter: null,
-      videoDuration: before.videoDuration,
-      metadataDuration: before.metadataDuration,
-      bufferedRanges: before.bufferedRanges,
-      requestId: requestId,
-      controller: 'pending'
-    });
+    debugLog('Seek', 'request', getSeekDebugDetails(
+      state,
+      request,
+      before,
+      { pendingCleared: false }
+    ));
 
-    if (isTimeBufferedValue(before.bufferedRanges, targetTime)) {
-      request.controller = 'video-buffered';
-      if (!applySeekPrecisionCorrection(state, request, 'target-already-buffered')) {
-        finishSeekRequest(state, request, false, 'precision-apply-failed');
-        return true;
-      }
-      confirmSeekRequest(state, request);
-      return true;
-    }
-
-    const bridgePayload = {
-      videoId: state.videoId,
-      seconds: targetTime,
-      allowSeekAhead: true
-    };
-    requestPageBridge('seek-preview', bridgePayload, PAGE_BRIDGE_TIMEOUT_MS)
+    const playerExecutionPlan = captionUtils.getSeekExecutionPlan
+      ? captionUtils.getSeekExecutionPlan(request.targetBuffered, true)
+      : [{
+        stage: request.targetBuffered
+          ? 'buffered-player-seek'
+          : 'unbuffered-load-seek',
+        allowSeekAhead: !request.targetBuffered
+      }];
+    const initialPlayerStage = playerExecutionPlan[0];
+    requestPlayerSeek(
+      state,
+      request,
+      initialPlayerStage.allowSeekAhead,
+      initialPlayerStage.stage
+    )
       .then(function (result) {
         if (!isCurrentSeekRequest(state, requestId)) {
           return;
         }
 
-        request.bridgeResult = result;
-        const usePlayerController = result && result.ok === true &&
-          result.seekToAvailable === true;
-        const controller = captionUtils.getSeekController
-          ? captionUtils.getSeekController(usePlayerController)
-          : usePlayerController ? 'player' : 'video';
-        request.controller = controller === 'player' ? 'player-load' : 'video-fallback';
-
-        let applied = true;
-        if (request.controller === 'player-load') {
-          waitForSeekPrecision(state, request);
-        } else {
-          applied = applySeekPrecisionCorrection(state, request, 'player-unavailable');
+        if (isPlayerSeekUsable(result)) {
+          request.playerControlled = true;
+          request.controller = request.targetBuffered
+            ? 'player-buffered'
+            : 'player-load';
+          debugLog('Seek', 'commit', getSeekDebugDetails(
+            state,
+            request,
+            getSeekSnapshot(state),
+            {
+              bridgeOk: true,
+              pendingCleared: false
+            }
+          ));
+          if (!request.targetBuffered) {
+            waitForSeekPrecision(state, request);
+          } else {
+            confirmSeekRequest(state, request);
+          }
+          return;
         }
 
-        const afterApply = getSeekSnapshot(state);
-        debugLog('Seek', 'commit', {
-          rangeValue: request.rangeValue,
-          requestedTime: request.targetTime,
-          videoCurrentTimeBefore: request.before.videoCurrentTime,
-          videoCurrentTimeAfter: afterApply.videoCurrentTime,
-          playerFound: result && result.playerFound === true
-            ? true
-            : afterApply.playerFound,
-          playerSeekToAvailable: result && result.seekToAvailable === true
-            ? true
-            : afterApply.playerSeekToAvailable,
-          playerCurrentTimeBefore: request.before.playerCurrentTime,
-          playerCurrentTimeAfter: result && result.playerCurrentTimeAfter !== null
-            ? result.playerCurrentTimeAfter
-            : afterApply.playerCurrentTime,
-          videoDuration: afterApply.videoDuration,
-          metadataDuration: afterApply.metadataDuration,
-          bufferedRanges: afterApply.bufferedRanges,
-          requestId: requestId,
-          controller: request.controller,
-          bridgeOk: Boolean(result && result.ok),
-          applied: applied,
-          precisionCorrectionApplied: request.precisionCorrectionApplied
-        });
+        if (!canFallbackToVideoSeek(result)) {
+          request.controller = 'player-failed';
+          finishSeekRequest(state, request, false, 'player-seek-failed');
+          return;
+        }
 
+        request.controller = request.targetBuffered
+          ? 'video-fallback-buffered'
+          : 'video-fallback';
+        const applied = applyVideoFallbackSeek(state, request, result
+          ? 'player-unavailable'
+          : 'bridge-unavailable');
+        debugLog('Seek', 'commit', getSeekDebugDetails(
+          state,
+          request,
+          getSeekSnapshot(state),
+          {
+            bridgeOk: false,
+            applied: applied,
+            pendingCleared: false
+          }
+        ));
         if (!applied) {
           finishSeekRequest(state, request, false, 'apply-failed');
           return;
         }
-
-        if (request.controller !== 'player-load') {
-          confirmSeekRequest(state, request);
-        }
+        confirmSeekRequest(state, request);
       })
       .catch(function (error) {
         if (!isCurrentSeekRequest(state, requestId)) {
           return;
         }
 
-        reportError('seek-bridge', error);
+        reportError('seek-player-request', error);
         request.controller = 'video-fallback';
-        const applied = applySeekPrecisionCorrection(state, request, 'bridge-error');
-        debugLog('Seek', 'bridge-fallback', {
-          rangeValue: request.rangeValue,
-          requestedTime: request.targetTime,
-          requestId: requestId,
-          controller: request.controller,
-          applied: applied,
-          precisionCorrectionApplied: request.precisionCorrectionApplied
-        });
+        const applied = applyVideoFallbackSeek(state, request, 'player-request-error');
         if (!applied) {
           finishSeekRequest(state, request, false, 'apply-failed');
           return;

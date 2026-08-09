@@ -81,6 +81,25 @@
     return normalized ? normalized.split('\n') : [];
   }
 
+  function getTransientCaptionEmptyPlan(requestedText, visibleText, rendererRawText, windows) {
+    const requested = normalizeCaptionLines(requestedText);
+    const visible = normalizeCaptionLines(visibleText);
+    const rendererText = normalizeCaptionLines(rendererRawText);
+    const physicalWindows = Array.isArray(windows) ? windows : [];
+    const matchingWindowIndex = !requested && visible && rendererText
+      ? physicalWindows.findIndex(function (captionWindow) {
+        return captionWindow &&
+          normalizeCaptionLines(captionWindow.rawText) &&
+          normalizeCaptionLines(captionWindow.extractedText) === visible;
+      })
+      : -1;
+
+    return {
+      shouldSuppress: matchingWindowIndex >= 0,
+      matchingWindowIndex: matchingWindowIndex
+    };
+  }
+
   function isStrictCaptionLineSuperset(previousLines, candidateLines) {
     const previous = getNormalizedCaptionLineList(previousLines);
     const candidate = getNormalizedCaptionLineList(candidateLines);
@@ -1063,6 +1082,7 @@
     normalizeDuration: normalizeDuration,
     normalizeCaptionLines: normalizeCaptionLines,
     getNormalizedCaptionLineList: getNormalizedCaptionLineList,
+    getTransientCaptionEmptyPlan: getTransientCaptionEmptyPlan,
     isStrictCaptionLineSuperset: isStrictCaptionLineSuperset,
     getRollupCaptionTransitionPlan: getRollupCaptionTransitionPlan,
     isCaptionTransitionCurrent: isCaptionTransitionCurrent,

@@ -121,6 +121,41 @@ test('normalizes native caption text and state conservatively', () => {
   });
 });
 
+test('suppresses only structural transient caption empties that match the complete visible paragraph', () => {
+  const visible = '>> First line\n>> Second line';
+  const capturedFalseEmpty = utils.getTransientCaptionEmptyPlan('', visible,
+    'Older roll-up material\n' + visible, [{
+      rawText: 'Older roll-up material\n' + visible,
+      extractedText: visible
+    }]);
+
+  assert.deepEqual(JSON.parse(JSON.stringify(capturedFalseEmpty)), {
+    shouldSuppress: true,
+    matchingWindowIndex: 0
+  });
+
+  const restored = utils.getTransientCaptionEmptyPlan(visible, visible, visible, [{
+    rawText: visible,
+    extractedText: visible
+  }]);
+  assert.equal(restored.shouldSuppress, false);
+
+  const trueEmpty = utils.getTransientCaptionEmptyPlan('', visible, '', []);
+  assert.equal(trueEmpty.shouldSuppress, false);
+
+  const differentWindow = utils.getTransientCaptionEmptyPlan('', visible, 'Different text', [{
+    rawText: 'Different text',
+    extractedText: 'Different text'
+  }]);
+  assert.equal(differentWindow.shouldSuppress, false);
+
+  const missingRawText = utils.getTransientCaptionEmptyPlan('', visible, visible, [{
+    rawText: '',
+    extractedText: visible
+  }]);
+  assert.equal(missingRawText.shouldSuppress, false);
+});
+
 test('keeps seek UI pending until one authoritative commit is confirmed', () => {
   assert.equal(utils.clampSeekTime(-4, 300), 0);
   assert.equal(utils.clampSeekTime(138, 300), 138);

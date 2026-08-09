@@ -3001,8 +3001,69 @@
     });
   }
 
-  function commitMirroredCaptionText(state, text) {
-    if (!text) {
+  function getTransientCaptionEmptyPlan(state, renderer, requestedText) {
+    if (!renderer || !renderer.isConnected || !state.captionVisualText ||
+      !captionUtils.getTransientCaptionEmptyPlan) {
+      return { shouldSuppress: false, matchingWindowIndex: -1, windows: [], rendererRawText: '' };
+    }
+
+    const windows = getCaptionWindows(renderer);
+    const rendererRawText = typeof renderer.innerText === 'string'
+      ? renderer.innerText
+      : renderer.textContent || '';
+    const windowDetails = windows.map(function (captionWindow) {
+      return {
+        rawText: typeof captionWindow.innerText === 'string'
+          ? captionWindow.innerText
+          : captionWindow.textContent || '',
+        extractedText: readCaptionWindowText(captionWindow, renderer)
+      };
+    });
+    const plan = captionUtils.getTransientCaptionEmptyPlan(
+      requestedText,
+      state.captionVisualText,
+      rendererRawText,
+      windowDetails
+    );
+    return Object.assign(plan, {
+      windows: windows,
+      windowDetails: windowDetails,
+      rendererRawText: rendererRawText
+    });
+  }
+
+  function logCaptionTransientEmptySuppressed(state, plan, requestedText) {
+    const matchingWindow = plan.windows[plan.matchingWindowIndex];
+    const matchingWindowDetails = plan.windowDetails[plan.matchingWindowIndex];
+    forensicLog('CaptionForensics', 'captionTransientEmptySuppressed', {
+      generation: state.captionGeneration,
+      videoCurrentTime: readVideoCurrentTime(state),
+      visibleOverlayCaption: state.captionVisualText || '',
+      authoritativeCaption: state.captionCommittedText || '',
+      finalMirroredCaptionText: requestedText || '',
+      physicalCaptionWindowCount: plan.windows.length,
+      activeCaptionWindowCount: state.captionActiveWindows ? state.captionActiveWindows.size : 0,
+      rendererRawText: String(plan.rendererRawText || '').slice(0, 8192),
+      matchingWindowDebugId: matchingWindow ? getCaptionWindowDebugId(matchingWindow) : '',
+      matchingWindowExtractedText: matchingWindowDetails
+        ? matchingWindowDetails.extractedText
+        : '',
+      reason: 'physical-window-complete-visible-paragraph-match'
+    });
+  }
+
+  function commitMirroredCaptionText(state, text, options) {
+    const nativeEmpty = !text;
+    const canSuppressTransientEmpty = nativeEmpty && options &&
+      options.allowTransientEmptySuppression === true;
+    const transientEmptyPlan = canSuppressTransientEmpty
+      ? getTransientCaptionEmptyPlan(state, options.renderer, text)
+      : null;
+    if (transientEmptyPlan && transientEmptyPlan.shouldSuppress) {
+      logCaptionTransientEmptySuppressed(state, transientEmptyPlan, text);
+      return false;
+    }
+    if (nativeEmpty) {
       logCaptionVisualClear(state, 'Requested', 'native-empty', text);
       logCaptionPaintForensics(state, 'before-native-empty-clear', text);
     }
@@ -3016,10 +3077,11 @@
     state.controls.captionCurrent.textContent = text;
     state.controls.captionIncoming.textContent = '';
     state.controls.captions.hidden = !text;
-    if (!text) {
+    if (nativeEmpty) {
       logCaptionVisualClear(state, 'Applied', 'native-empty', text);
       logCaptionPaintForensics(state, 'after-native-empty-clear', text);
     }
+    return true;
   }
 
   function getRollupGeometrySnapshot(state, renderer) {
@@ -3352,8 +3414,14 @@
     state.rollupLastGeometry = geometry;
     const rollup = geometry.length > 0;
     if (!text) {
-      commitMirroredCaptionText(state, '');
-      resetRollupCaptionHistory(state, 'empty-caption');
+      const committed = commitMirroredCaptionText(state, '', {
+        renderer: info.renderer,
+        allowTransientEmptySuppression: info.enabled === true && !state.seekPending &&
+          !state.seekDragging
+      });
+      if (committed) {
+        resetRollupCaptionHistory(state, 'empty-caption');
+      }
       return info;
     }
     const rawRollupText = rollup ? getRawRollupCaptionText(state, info.renderer) : '';

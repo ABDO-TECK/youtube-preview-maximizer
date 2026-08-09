@@ -24,7 +24,12 @@
   const CAPTION_STATE_TIMEOUT_MS = 450;
   const CAPTION_STATE_POLL_MS = 50;
   const MAX_SEEK_SECONDS = 86400;
-  const DEBUG_LOGGING = false;
+  const VIDEO_ASSOCIATION_PATTERN = /^[a-f0-9]{32}$/;
+  const ACTIVE_VIDEO_ASSOCIATION_ATTRIBUTE = 'data-ytpm-active-video-association';
+  const ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE = 'data-ytpm-active-player-association';
+  const PLAYER_VIDEO_SYNC_TOLERANCE = 1.5;
+  // Temporary runtime-forensics switch. This mirrors the content-script gate.
+  const DEBUG_LOGGING = true;
   const captionTrackMemory = new WeakMap();
 
   const currentScript = document.currentScript;
@@ -43,6 +48,22 @@
     }
 
     console.debug('[YTPM][' + scope + ']', message, details || {});
+  }
+
+  function seekForensicsLog(message, details) {
+    if (!DEBUG_LOGGING || typeof console === 'undefined' ||
+      typeof console.debug !== 'function') {
+      return;
+    }
+
+    console.debug('[YTPM][SeekForensics]', message, {
+      wallTime: new Date().toISOString(),
+      timestamp: typeof performance !== 'undefined' &&
+        typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now(),
+      details: details || {}
+    });
   }
 
   function isRequest(data) {
@@ -199,23 +220,156 @@
     }
   }
 
-  function seekPreview(player, context, seconds, allowSeekAhead) {
-    const targetTime = Math.max(0, Math.min(MAX_SEEK_SECONDS, Number(seconds)));
-    const playerFound = Boolean(context && player);
-    const before = readPlayerCurrentTime(player);
-    if (!playerFound || typeof player.seekTo !== 'function') {
+  function readVideoCurrentTime(video) {
+    const value = video ? Number(video.currentTime) : NaN;
+    return Number.isFinite(value) && value >= 0 && value <= MAX_SEEK_SECONDS
+      ? value
+      : null;
+  }
+
+  function getAssociatedSeekContext(associationId) {
+    if (typeof associationId !== 'string' || !VIDEO_ASSOCIATION_PATTERN.test(associationId)) {
+      return { video: null, player: null, videoAssociated: false, playerAssociated: false };
+    }
+    const video = Array.from(document.querySelectorAll('video')).find(function (candidate) {
+      return candidate.getAttribute(ACTIVE_VIDEO_ASSOCIATION_ATTRIBUTE) === associationId;
+    }) || null;
+    const playerElement = Array.from(document.querySelectorAll(
+      '[' + ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE + ']'
+    )).find(function (candidate) {
+      return candidate.getAttribute(ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE) === associationId;
+    }) || null;
+    const candidatePlayer = getApiPlayer(playerElement);
+    const playerTime = readPlayerCurrentTime(candidatePlayer);
+    const videoTime = readVideoCurrentTime(video);
+    const playerAssociated = Boolean(candidatePlayer &&
+      typeof candidatePlayer.seekTo === 'function' &&
+      playerTime !== null && videoTime !== null &&
+      Math.abs(playerTime - videoTime) <= PLAYER_VIDEO_SYNC_TOLERANCE);
+    return {
+      video: video,
+      player: playerAssociated ? candidatePlayer : null,
+      videoAssociated: Boolean(video),
+      playerFound: Boolean(candidatePlayer),
+      playerAssociated: playerAssociated,
+      playerCurrentTimeBefore: playerTime,
+      videoCurrentTimeBefore: videoTime
+    };
+  }
+
+  function readSeekDebugContext(data) {
+    if (!DEBUG_LOGGING || !data || typeof data !== 'object') {
       return {
-        ok: false,
-        available: playerFound,
-        playerFound: playerFound,
-        seekToAvailable: false,
-        targetTime: targetTime,
-        playerCurrentTimeBefore: before,
-        playerCurrentTimeAfter: before
+        requestId: null,
+        source: 'unknown',
+        stage: 'unknown'
       };
     }
 
+    const requestId = Number(data.debugRequestId);
+    const sanitizeLabel = function (value, fallback) {
+      const label = typeof value === 'string' ? value.slice(0, 80) : '';
+      return /^[A-Za-z0-9_-]{1,80}$/.test(label) ? label : fallback;
+    };
+    return {
+      requestId: Number.isInteger(requestId) && requestId >= 0
+        ? requestId
+        : null,
+      source: sanitizeLabel(data.debugSource, 'unknown'),
+      stage: sanitizeLabel(data.debugStage, 'unknown')
+    };
+  }
+
+  function seekPreview(context, seconds, allowSeekAhead, debugContext) {
+    const targetTime = Math.max(0, Math.min(MAX_SEEK_SECONDS, Number(seconds)));
+    const player = context && context.player;
+    const video = context && context.video;
+    const playerFound = Boolean(context && context.playerFound);
+    const before = context ? context.playerCurrentTimeBefore : null;
+    const videoBefore = context ? context.videoCurrentTimeBefore : null;
+    const trace = debugContext || {
+      requestId: null,
+      source: 'unknown',
+      stage: 'unknown'
+    };
+    seekForensicsLog('bridgeSeekReceived', {
+      requestId: trace.requestId,
+      source: trace.source,
+      stage: trace.stage,
+      target: targetTime,
+      allowSeekAhead: allowSeekAhead === true,
+      playerFound: playerFound,
+      seekToAvailable: Boolean(player && typeof player.seekTo === 'function'),
+      playerAssociated: Boolean(context && context.playerAssociated),
+      videoAssociated: Boolean(context && context.videoAssociated),
+      playerCurrentTimeBefore: before,
+      videoCurrentTimeBefore: videoBefore
+    });
+    if (!video) {
+      const unavailableResult = {
+        ok: false,
+        available: false,
+        playerFound: playerFound,
+        seekToAvailable: false,
+        playerAssociated: false,
+        videoAssociated: false,
+        targetTime: targetTime,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: before,
+        videoCurrentTimeBefore: videoBefore,
+        videoCurrentTimeAfter: null
+      };
+      seekForensicsLog('bridgeSeekReturned', {
+        requestId: trace.requestId,
+        source: trace.source,
+        stage: trace.stage,
+        target: targetTime,
+        allowSeekAhead: allowSeekAhead === true,
+        playerFound: playerFound,
+        seekToAvailable: false,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: before,
+        ok: false
+      });
+      return unavailableResult;
+    }
+
+    if (!player || typeof player.seekTo !== 'function') {
+      try {
+        video.currentTime = targetTime;
+        return {
+          ok: true,
+          available: true,
+          playerFound: playerFound,
+          seekToAvailable: false,
+          playerAssociated: false,
+          videoAssociated: true,
+          usedVideoFallback: true,
+          targetTime: targetTime,
+          playerCurrentTimeBefore: before,
+          playerCurrentTimeAfter: before,
+          videoCurrentTimeBefore: videoBefore,
+          videoCurrentTimeAfter: readVideoCurrentTime(video)
+        };
+      } catch (error) {
+        return {
+          ok: false, available: true, playerFound: playerFound, seekToAvailable: false,
+          playerAssociated: false, videoAssociated: true, targetTime: targetTime,
+          playerCurrentTimeBefore: before, playerCurrentTimeAfter: before,
+          videoCurrentTimeBefore: videoBefore, videoCurrentTimeAfter: readVideoCurrentTime(video)
+        };
+      }
+    }
+
     try {
+      seekForensicsLog('playerSeekToCall', {
+        requestId: trace.requestId,
+        source: trace.source,
+        stage: trace.stage,
+        target: targetTime,
+        allowSeekAhead: allowSeekAhead === true,
+        playerCurrentTimeBefore: before
+      });
       player.seekTo(targetTime, allowSeekAhead === true);
       const after = readPlayerCurrentTime(player);
       debugLog('Seek', 'player seekTo', {
@@ -226,15 +380,30 @@
         playerCurrentTimeAfter: after,
         allowSeekAhead: allowSeekAhead === true
       });
-      return {
+      const result = {
         ok: true,
         available: true,
         playerFound: true,
         seekToAvailable: true,
+        playerAssociated: true,
+        videoAssociated: true,
         targetTime: targetTime,
         playerCurrentTimeBefore: before,
-        playerCurrentTimeAfter: after
+        playerCurrentTimeAfter: after,
+        videoCurrentTimeBefore: videoBefore,
+        videoCurrentTimeAfter: readVideoCurrentTime(video)
       };
+      seekForensicsLog('playerSeekToReturn', {
+        requestId: trace.requestId,
+        source: trace.source,
+        stage: trace.stage,
+        target: targetTime,
+        allowSeekAhead: allowSeekAhead === true,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: after,
+        ok: true
+      });
+      return result;
     } catch (error) {
       debugLog('Seek', 'player seekTo failed', {
         requestedTime: targetTime,
@@ -244,15 +413,31 @@
         playerCurrentTimeAfter: readPlayerCurrentTime(player),
         allowSeekAhead: allowSeekAhead === true
       });
-      return {
+      const failedResult = {
         ok: false,
         available: true,
         playerFound: true,
         seekToAvailable: true,
+        playerAssociated: true,
+        videoAssociated: true,
         targetTime: targetTime,
         playerCurrentTimeBefore: before,
-        playerCurrentTimeAfter: readPlayerCurrentTime(player)
+        playerCurrentTimeAfter: readPlayerCurrentTime(player),
+        videoCurrentTimeBefore: videoBefore,
+        videoCurrentTimeAfter: readVideoCurrentTime(video)
       };
+      seekForensicsLog('playerSeekToReturn', {
+        requestId: trace.requestId,
+        source: trace.source,
+        stage: trace.stage,
+        target: targetTime,
+        allowSeekAhead: allowSeekAhead === true,
+        playerCurrentTimeBefore: before,
+        playerCurrentTimeAfter: failedResult.playerCurrentTimeAfter,
+        ok: false,
+        errorName: error && error.name ? error.name : 'UnknownError'
+      });
+      return failedResult;
     }
   }
 
@@ -1160,6 +1345,8 @@
       const seconds = Number(data.seconds);
       if (
         !requestedVideoId ||
+        typeof data.videoAssociationId !== 'string' ||
+        !VIDEO_ASSOCIATION_PATTERN.test(data.videoAssociationId) ||
         !Number.isFinite(seconds) ||
         seconds < 0 ||
         seconds > MAX_SEEK_SECONDS ||
@@ -1172,7 +1359,12 @@
           seekToAvailable: false
         };
       }
-      return seekPreview(player, context, seconds, data.allowSeekAhead);
+      return seekPreview(
+        getAssociatedSeekContext(data.videoAssociationId),
+        seconds,
+        data.allowSeekAhead,
+        readSeekDebugContext(data)
+      );
     }
 
     if (command === 'caption-catalog') {

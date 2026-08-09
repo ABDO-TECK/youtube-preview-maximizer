@@ -78,10 +78,16 @@
   const SEEK_CONFIRM_TOLERANCE = 0.5;
   const SEEK_BUFFER_SAFETY_MARGIN = 0.05;
   const SEEK_PRECISION_TIMEOUT_MS = 1800;
+  const CAPTION_TRANSITION_DURATION_MS = 140;
+  const ACTIVE_VIDEO_ASSOCIATION_ATTRIBUTE = 'data-ytpm-active-video-association';
+  const ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE = 'data-ytpm-active-player-association';
   const SEEK_MAX_SECONDS = 86400;
   const CONTROLS_HIDE_DELAY_MS = 5000;
   const BRIDGE_ID_PATTERN = /^request-\d{1,12}$/;
-  const DEBUG_LOGGING = false;
+  // Temporary runtime-forensics switch. Keep all diagnostic behavior behind
+  // this gate so it can be removed without changing the production paths.
+  const DEBUG_LOGGING = true;
+  const FORENSIC_LOG_LIMIT = 1500;
   const captionUtils = globalThis.YTPMCaptionUtils || {};
 
   let activeOverlay = null;
@@ -105,6 +111,14 @@
   const cardPreviewVideoMap = new WeakMap();
   const bridgeRequests = new Map();
   const bridgeReadyWaiters = [];
+  const forensicLogBuffer = [];
+  const captionWindowDebugIds = new WeakMap();
+  const captionNodeDebugIds = new WeakMap();
+  const captionRendererDebugIds = new WeakMap();
+  let captionWindowDebugCounter = 0;
+  let captionNodeDebugCounter = 0;
+  let captionRendererDebugCounter = 0;
+  let forensicHelpersInstalled = false;
 
   function reportError(operation, error) {
     if (!DEBUG_LOGGING) {
@@ -139,6 +153,88 @@
     console.debug('[YTPM][' + scope + ']', message, details || {});
   }
 
+  function forensicLog(scope, message, details) {
+    if (!DEBUG_LOGGING || typeof console === 'undefined' ||
+      typeof console.debug !== 'function') {
+      return;
+    }
+
+    let serializableDetails = {};
+    try {
+      serializableDetails = JSON.parse(JSON.stringify(details || {}));
+    } catch (error) {
+      serializableDetails = {
+        serializationError: error && error.name ? error.name : 'SerializationError'
+      };
+    }
+    const entry = {
+      scope: scope,
+      message: message,
+      wallTime: new Date().toISOString(),
+      timestamp: typeof performance !== 'undefined' &&
+        typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now(),
+      details: serializableDetails
+    };
+    forensicLogBuffer.push(entry);
+    if (forensicLogBuffer.length > FORENSIC_LOG_LIMIT) {
+      forensicLogBuffer.splice(0, forensicLogBuffer.length - FORENSIC_LOG_LIMIT);
+    }
+    console.debug('[YTPM][' + scope + ']', message, entry);
+  }
+
+  function serializeForensicBuffer() {
+    const data = forensicLogBuffer.slice();
+    return JSON.stringify(data, null, 2);
+  }
+
+  function getWeakDebugId(map, node, prefix, nextId) {
+    if (!node || (typeof node !== 'object' && typeof node !== 'function')) {
+      return '';
+    }
+    if (!map.has(node)) {
+      map.set(node, prefix + String(nextId()));
+    }
+    return map.get(node);
+  }
+
+  function getCaptionWindowDebugId(node) {
+    return getWeakDebugId(
+      captionWindowDebugIds,
+      node,
+      'window-',
+      function () {
+        captionWindowDebugCounter += 1;
+        return captionWindowDebugCounter;
+      }
+    );
+  }
+
+  function getCaptionNodeDebugId(node) {
+    return getWeakDebugId(
+      captionNodeDebugIds,
+      node,
+      'node-',
+      function () {
+        captionNodeDebugCounter += 1;
+        return captionNodeDebugCounter;
+      }
+    );
+  }
+
+  function getCaptionRendererDebugId(node) {
+    return getWeakDebugId(
+      captionRendererDebugIds,
+      node,
+      'renderer-',
+      function () {
+        captionRendererDebugCounter += 1;
+        return captionRendererDebugCounter;
+      }
+    );
+  }
+
   function createBridgeNonce() {
     const bytes = new Uint8Array(16);
     window.crypto.getRandomValues(bytes);
@@ -146,6 +242,28 @@
     return Array.from(bytes).map(function (byte) {
       return byte.toString(16).padStart(2, '0');
     }).join('');
+  }
+
+  function markSeekAssociation(state) {
+    state.seekAssociationId = createBridgeNonce();
+    state.video.setAttribute(ACTIVE_VIDEO_ASSOCIATION_ATTRIBUTE, state.seekAssociationId);
+    const player = state.playerApi && state.playerApi.nodeType === 1 ? state.playerApi : null;
+    state.seekAssociatedPlayerElement = player;
+    if (player) {
+      player.setAttribute(ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE, state.seekAssociationId);
+    }
+  }
+
+  function clearSeekAssociation(state) {
+    if (state.video && state.video.getAttribute(ACTIVE_VIDEO_ASSOCIATION_ATTRIBUTE) ===
+      state.seekAssociationId) {
+      state.video.removeAttribute(ACTIVE_VIDEO_ASSOCIATION_ATTRIBUTE);
+    }
+    if (state.seekAssociatedPlayerElement &&
+      state.seekAssociatedPlayerElement.getAttribute(ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE) ===
+        state.seekAssociationId) {
+      state.seekAssociatedPlayerElement.removeAttribute(ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE);
+    }
   }
 
   function isBridgeEnvelope(data) {
@@ -275,9 +393,14 @@
       available: result.available === true,
       playerFound: result.playerFound === true,
       seekToAvailable: result.seekToAvailable === true,
+      playerAssociated: result.playerAssociated === true,
+      videoAssociated: result.videoAssociated === true,
+      usedVideoFallback: result.usedVideoFallback === true,
       targetTime: sanitizeTime(result.targetTime),
       playerCurrentTimeBefore: sanitizeTime(result.playerCurrentTimeBefore),
-      playerCurrentTimeAfter: sanitizeTime(result.playerCurrentTimeAfter)
+      playerCurrentTimeAfter: sanitizeTime(result.playerCurrentTimeAfter),
+      videoCurrentTimeBefore: sanitizeTime(result.videoCurrentTimeBefore),
+      videoCurrentTimeAfter: sanitizeTime(result.videoCurrentTimeAfter)
     };
   }
 
@@ -1538,6 +1661,15 @@
     captions.setAttribute('aria-live', 'polite');
     captions.setAttribute('aria-atomic', 'true');
     captions.hidden = true;
+    const captionViewport = document.createElement('div');
+    captionViewport.className = 'ytpm-overlay__caption-viewport';
+    const captionCurrent = document.createElement('div');
+    captionCurrent.className = 'ytpm-overlay__caption-layer ytpm-overlay__caption-layer--current';
+    const captionIncoming = document.createElement('div');
+    captionIncoming.className = 'ytpm-overlay__caption-layer ytpm-overlay__caption-layer--incoming';
+    captionViewport.appendChild(captionCurrent);
+    captionViewport.appendChild(captionIncoming);
+    captions.appendChild(captionViewport);
 
     const qualityWrap = document.createElement('span');
     qualityWrap.className = QUALITY_CLASS;
@@ -1597,6 +1729,9 @@
         seekInput: seekInput,
         timeLabel: timeLabel,
         captions: captions,
+        captionViewport: captionViewport,
+        captionCurrent: captionCurrent,
+        captionIncoming: captionIncoming,
         timelinePreview: timelinePreview,
         timelineImage: timelineImage,
         timelineTime: timelineTime,
@@ -1863,7 +1998,53 @@
     return windows;
   }
 
-  function readCaptionWindowText(captionWindow) {
+  function getCaptionEffectiveClipRect(captionWindow, renderer) {
+    if (!captionWindow || !captionWindow.isConnected) {
+      return null;
+    }
+
+    let clip = captionWindow.getBoundingClientRect();
+    let ancestor = captionWindow.parentElement;
+    while (ancestor) {
+      const style = window.getComputedStyle(ancestor);
+      const clipsContent = /(hidden|clip)/.test(style.overflow + style.overflowX + style.overflowY) ||
+        style.clip !== 'auto' || style.clipPath !== 'none' || style.webkitClipPath !== 'none';
+      if (clipsContent) {
+        clip = captionUtils.intersectCaptionRects
+          ? captionUtils.intersectCaptionRects(clip, ancestor.getBoundingClientRect())
+          : null;
+      }
+      if (!clip || ancestor === renderer) {
+        break;
+      }
+      ancestor = ancestor.parentElement;
+    }
+    if (clip && renderer && renderer.isConnected && renderer !== captionWindow) {
+      clip = captionUtils.intersectCaptionRects
+        ? captionUtils.intersectCaptionRects(clip, renderer.getBoundingClientRect())
+        : clip;
+    }
+    return clip;
+  }
+
+  function isPresentedCaptionSegment(segment, captionWindow, renderer) {
+    if (!isVisibleCaptionNode(segment) || !captionUtils.getCaptionSegmentMirrorPlan) {
+      return false;
+    }
+    return captionUtils.getCaptionSegmentMirrorPlan(
+      segment.getBoundingClientRect(),
+      getCaptionEffectiveClipRect(captionWindow, renderer),
+      0.5
+    ).shouldMirror;
+  }
+
+  function isRollupCaptionWindow(captionWindow) {
+    return Boolean(captionWindow && /ytp-caption-window-rollup|ytp-rollup-mode/.test(
+      captionWindow.className || ''
+    ));
+  }
+
+  function readCaptionWindowText(captionWindow, renderer) {
     if (!isVisibleCaptionNode(captionWindow)) {
       return '';
     }
@@ -1880,13 +2061,17 @@
       '.ytp-caption-segment, [class*="caption-segment" i]'
     ));
     candidates.forEach(function (segment) {
-      if (!seenSegments.has(segment) && isVisibleCaptionNode(segment)) {
+      if (!seenSegments.has(segment) && isPresentedCaptionSegment(
+        segment,
+        captionWindow,
+        renderer
+      )) {
         seenSegments.add(segment);
         segments.push(segment);
       }
     });
 
-    const values = segments.length
+    const values = candidates.length
       ? segments.map(function (segment) {
         return segment.textContent || '';
       })
@@ -1901,6 +2086,442 @@
     return values.map(function (value) {
       return String(value || '').replace(/[ \t]+/g, ' ').trim();
     }).filter(Boolean).join('\n').slice(0, 8192);
+  }
+
+  function readForensicClassName(node) {
+    const element = node && node.nodeType === 1
+      ? node
+      : node && node.parentElement;
+    if (!element) {
+      return '';
+    }
+
+    return typeof element.className === 'string'
+      ? element.className.slice(0, 1000)
+      : element.getAttribute('class') || '';
+  }
+
+  function readForensicRect(node) {
+    if (!node) {
+      return null;
+    }
+
+    try {
+      let rect = null;
+      if (node.nodeType === 1 && typeof node.getBoundingClientRect === 'function') {
+        rect = node.getBoundingClientRect();
+      } else if (node.nodeType === 3 && document.createRange) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        rect = range.getBoundingClientRect();
+      }
+      if (!rect) {
+        return null;
+      }
+
+      return {
+        top: Number(rect.top),
+        bottom: Number(rect.bottom),
+        left: Number(rect.left),
+        right: Number(rect.right),
+        width: Number(rect.width),
+        height: Number(rect.height)
+      };
+    } catch (error) {
+      reportError('caption-forensics-rect', error);
+      return null;
+    }
+  }
+
+  function intersectForensicRects(first, second) {
+    if (!first || !second) {
+      return null;
+    }
+
+    const left = Math.max(first.left, second.left);
+    const right = Math.min(first.right, second.right);
+    const top = Math.max(first.top, second.top);
+    const bottom = Math.min(first.bottom, second.bottom);
+    if (right <= left || bottom <= top) {
+      return null;
+    }
+
+    return {
+      top: top,
+      bottom: bottom,
+      left: left,
+      right: right,
+      width: right - left,
+      height: bottom - top
+    };
+  }
+
+  function readCaptionForensicStyle(node) {
+    const element = node && node.nodeType === 1
+      ? node
+      : node && node.parentElement;
+    if (!element) {
+      return null;
+    }
+
+    try {
+      const style = window.getComputedStyle(element);
+      return {
+        display: style.display,
+        visibility: style.visibility,
+        opacity: style.opacity,
+        position: style.position,
+        transform: style.transform,
+        overflow: style.overflow,
+        overflowX: style.overflowX,
+        overflowY: style.overflowY,
+        overflowClipMargin: style.overflowClipMargin || '',
+        clip: style.clip,
+        clipPath: style.clipPath,
+        maskImage: style.maskImage || '',
+        webkitMaskImage: style.webkitMaskImage || '',
+        contain: style.contain || '',
+        contentVisibility: style.contentVisibility || ''
+      };
+    } catch (error) {
+      reportError('caption-forensics-style', error);
+      return null;
+    }
+  }
+
+  function isForensicClippingStyle(style) {
+    if (!style) {
+      return false;
+    }
+
+    const clipsOverflow = [style.overflow, style.overflowX, style.overflowY]
+      .some(function (value) {
+        return value === 'hidden' || value === 'clip' || value === 'scroll' ||
+          value === 'auto';
+      });
+    return clipsOverflow ||
+      (style.clip && style.clip !== 'auto') ||
+      (style.clipPath && style.clipPath !== 'none') ||
+      (style.maskImage && style.maskImage !== 'none') ||
+      (style.webkitMaskImage && style.webkitMaskImage !== 'none');
+  }
+
+  function getCaptionClippingAncestors(node, renderer) {
+    const ancestors = [];
+    let current = node && node.nodeType === 1 ? node.parentElement : node && node.parentElement;
+
+    while (current) {
+      const style = readCaptionForensicStyle(current);
+      if (isForensicClippingStyle(style)) {
+        ancestors.push({
+          nodeDebugId: current.matches && current.matches('.caption-window')
+            ? getCaptionWindowDebugId(current)
+            : getCaptionNodeDebugId(current),
+          tagName: current.tagName ? current.tagName.toLowerCase() : '',
+          className: readForensicClassName(current),
+          rect: readForensicRect(current),
+          style: style
+        });
+      }
+      if (current === renderer) {
+        break;
+      }
+      current = current.parentElement;
+    }
+
+    return ancestors;
+  }
+
+  function getCaptionGeometrySnapshot(node, captionWindow, renderer) {
+    const rect = readForensicRect(node);
+    const windowRect = readForensicRect(captionWindow);
+    const rendererRect = readForensicRect(renderer);
+    const clippingAncestors = getCaptionClippingAncestors(node, renderer);
+    let effectiveClipRect = rect;
+
+    clippingAncestors.forEach(function (ancestor) {
+      effectiveClipRect = intersectForensicRects(effectiveClipRect, ancestor.rect);
+    });
+
+    return {
+      rect: rect,
+      captionWindowRect: windowRect,
+      rendererRect: rendererRect,
+      intersectionWithCaptionWindow: intersectForensicRects(rect, windowRect),
+      intersectionWithRenderer: intersectForensicRects(rect, rendererRect),
+      clippingAncestors: clippingAncestors,
+      effectiveClipRect: effectiveClipRect,
+      presentedByGeometry: Boolean(
+        rect && rect.width > 0 && rect.height > 0 &&
+        effectiveClipRect && effectiveClipRect.width > 0 && effectiveClipRect.height > 0
+      )
+    };
+  }
+
+  function getCaptionSegmentNodes(captionWindow) {
+    const segments = [];
+    const seen = new Set();
+    const addSegment = function (segment) {
+      if (segment && !seen.has(segment)) {
+        seen.add(segment);
+        segments.push(segment);
+      }
+    };
+
+    if (captionWindow && captionWindow.matches && captionWindow.matches(
+      '.ytp-caption-segment, [class*="caption-segment" i]'
+    )) {
+      addSegment(captionWindow);
+    }
+    if (captionWindow && captionWindow.querySelectorAll) {
+      captionWindow.querySelectorAll(
+        '.ytp-caption-segment, [class*="caption-segment" i]'
+      ).forEach(addSegment);
+    }
+
+    return segments;
+  }
+
+  function getCaptionLineContainers(captionWindow, segments) {
+    const containers = [];
+    const seen = new Set();
+    const addContainer = function (container) {
+      if (!container || container === captionWindow || seen.has(container)) {
+        return;
+      }
+      if (!String(container.textContent || '').trim()) {
+        return;
+      }
+      seen.add(container);
+      containers.push(container);
+    };
+
+    if (captionWindow && captionWindow.querySelectorAll) {
+      captionWindow.querySelectorAll(
+        '.caption-visual-line, .captions-text, ' +
+        '[class*="caption-line" i], [class*="captions-text" i], ' +
+        '[class*="visual-line" i]'
+      ).forEach(addContainer);
+    }
+    (segments || []).forEach(function (segment) {
+      let current = segment.parentElement;
+      while (current && current !== captionWindow) {
+        if (current === segment.parentElement ||
+          /caption|line|text/i.test(readForensicClassName(current))) {
+          addContainer(current);
+        }
+        current = current.parentElement;
+      }
+    });
+
+    return containers;
+  }
+
+  function getCaptionMeaningfulTextNodes(captionWindow) {
+    if (!captionWindow || !document.createTreeWalker) {
+      return [];
+    }
+
+    const nodes = [];
+    const walker = document.createTreeWalker(captionWindow, 4);
+    let current = walker.nextNode();
+    while (current) {
+      if (String(current.nodeValue || '').trim()) {
+        nodes.push(current);
+      }
+      current = walker.nextNode();
+    }
+    return nodes;
+  }
+
+  function getCaptionNodeSnapshot(node, captionWindow, renderer, domIndex, kind) {
+    const element = node && node.nodeType === 1 ? node : node && node.parentElement;
+    return {
+      segmentDebugId: getCaptionNodeDebugId(node),
+      kind: kind,
+      domIndex: domIndex,
+      tagName: element && element.tagName ? element.tagName.toLowerCase() : '#text',
+      className: readForensicClassName(node),
+      ariaHidden: element ? element.getAttribute('aria-hidden') || '' : '',
+      hidden: Boolean(element && element.hidden),
+      text: String(node && (node.nodeValue || node.textContent) || '').slice(0, 8192),
+      style: readCaptionForensicStyle(node),
+      geometry: getCaptionGeometrySnapshot(node, captionWindow, renderer)
+    };
+  }
+
+  function getCaptionRendererIdentifier(renderer) {
+    return {
+      rendererDebugId: getCaptionRendererDebugId(renderer),
+      tagName: renderer && renderer.tagName ? renderer.tagName.toLowerCase() : '',
+      id: renderer && renderer.id ? String(renderer.id).slice(0, 200) : '',
+      className: readForensicClassName(renderer)
+    };
+  }
+
+  function summarizeCaptionMutationNode(node, renderer) {
+    if (!node) {
+      return null;
+    }
+
+    const isElementNode = node.nodeType === 1;
+    const descendantWindows = [];
+    if (isElementNode && node.matches && node.matches('.caption-window')) {
+      descendantWindows.push(getCaptionWindowDebugId(node));
+    }
+    if (node.querySelectorAll) {
+      node.querySelectorAll('.caption-window').forEach(function (captionWindow) {
+        const debugId = getCaptionWindowDebugId(captionWindow);
+        if (!descendantWindows.includes(debugId)) {
+          descendantWindows.push(debugId);
+        }
+      });
+    }
+    const owner = getCaptionWindowOwnerFromNode(node, renderer, true);
+    return {
+      nodeDebugId: isElementNode && node.matches && node.matches('.caption-window')
+        ? getCaptionWindowDebugId(node)
+        : getCaptionNodeDebugId(node),
+      nodeType: node.nodeType,
+      tagName: isElementNode && node.tagName ? node.tagName.toLowerCase() : '#text',
+      className: readForensicClassName(node),
+      text: String(node.nodeValue || node.textContent || '').trim().slice(0, 1000),
+      ownerCaptionWindowDebugId: owner ? getCaptionWindowDebugId(owner) : '',
+      descendantCaptionWindowDebugIds: descendantWindows
+    };
+  }
+
+  function getCaptionMutationSnapshots(mutations, renderer) {
+    return Array.from(mutations || []).map(function (mutation) {
+      const owner = getCaptionWindowOwnerFromNode(mutation.target, renderer, true);
+      return {
+        type: mutation.type,
+        attributeName: mutation.attributeName || '',
+        target: summarizeCaptionMutationNode(mutation.target, renderer),
+        targetCaptionWindowDebugId: owner ? getCaptionWindowDebugId(owner) : '',
+        addedNodes: Array.from(mutation.addedNodes || []).map(function (node) {
+          return summarizeCaptionMutationNode(node, renderer);
+        }),
+        removedNodes: Array.from(mutation.removedNodes || []).map(function (node) {
+          return summarizeCaptionMutationNode(node, renderer);
+        })
+      };
+    });
+  }
+
+  function buildCaptionForensicSnapshot(state, renderer, mutations, phase) {
+    if (!DEBUG_LOGGING || !renderer) {
+      return null;
+    }
+
+    const currentWindows = getCaptionWindows(renderer);
+    const activeWindows = Array.from(state && state.captionActiveWindows || [])
+      .filter(function (captionWindow) {
+        return currentWindows.includes(captionWindow);
+      });
+    const rendererStyle = readCaptionForensicStyle(renderer);
+    const rendererSnapshot = Object.assign(
+      getCaptionRendererIdentifier(renderer),
+      {
+        rect: readForensicRect(renderer),
+        style: rendererStyle,
+        ariaHidden: renderer.getAttribute('aria-hidden') || '',
+        hidden: Boolean(renderer.hidden),
+        innerText: String(
+          typeof renderer.innerText === 'string'
+            ? renderer.innerText
+            : renderer.textContent || ''
+        ).slice(0, 8192)
+      }
+    );
+
+    const windows = currentWindows.map(function (captionWindow, windowIndex) {
+      const segments = getCaptionSegmentNodes(captionWindow);
+      const lineContainers = getCaptionLineContainers(captionWindow, segments);
+      const textNodes = getCaptionMeaningfulTextNodes(captionWindow);
+      const extractedText = readCaptionWindowText(captionWindow, renderer);
+      return {
+        windowDebugId: getCaptionWindowDebugId(captionWindow),
+        domIndex: windowIndex,
+        tagName: captionWindow.tagName ? captionWindow.tagName.toLowerCase() : '',
+        className: readForensicClassName(captionWindow),
+        ariaHidden: captionWindow.getAttribute('aria-hidden') || '',
+        hidden: Boolean(captionWindow.hidden),
+        style: readCaptionForensicStyle(captionWindow),
+        rect: readForensicRect(captionWindow),
+        geometry: getCaptionGeometrySnapshot(captionWindow, captionWindow, renderer),
+        innerText: String(
+          typeof captionWindow.innerText === 'string'
+            ? captionWindow.innerText
+            : captionWindow.textContent || ''
+        ).slice(0, 8192),
+        isActiveForExtension: activeWindows.includes(captionWindow),
+        extensionGeneration: state && state.captionWindowGenerations
+          ? state.captionWindowGenerations.get(captionWindow) || 0
+          : 0,
+        extensionExtractedText: extractedText,
+        extensionExtractedLines: extractedText ? extractedText.split('\n') : [],
+        segments: segments.map(function (segment, index) {
+          return getCaptionNodeSnapshot(
+            segment,
+            captionWindow,
+            renderer,
+            index,
+            'segment'
+          );
+        }),
+        lineContainers: lineContainers.map(function (container, index) {
+          return getCaptionNodeSnapshot(
+            container,
+            captionWindow,
+            renderer,
+            index,
+            'line-container'
+          );
+        }),
+        textNodes: textNodes.map(function (textNode, index) {
+          return getCaptionNodeSnapshot(
+            textNode,
+            captionWindow,
+            renderer,
+            index,
+            'text-node'
+          );
+        })
+      };
+    });
+
+    return {
+      phase: phase || 'snapshot',
+      generation: state ? state.captionGeneration : 0,
+      timestamp: typeof performance !== 'undefined' &&
+        typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now(),
+      videoId: state && state.videoId ? state.videoId : '',
+      renderer: rendererSnapshot,
+      mutations: getCaptionMutationSnapshots(mutations, renderer),
+      activeWindowDebugIds: activeWindows.map(getCaptionWindowDebugId),
+      extensionExtractedLines: activeWindows.map(function (captionWindow) {
+        return readCaptionWindowText(captionWindow, renderer);
+      })
+        .filter(Boolean),
+      finalMirroredCaptionText: readNativeCaptionText(state, renderer),
+      overlayCaptionText: state && state.controls && state.controls.captions
+        ? state.controls.captions.textContent || ''
+        : '',
+      overlayAnimation: state && state.controls
+        ? {
+          authoritativeCaption: state.captionCommittedText || state.nativeCaptionText || '',
+          visibleOverlayCaption: state.controls.captions.textContent || '',
+          animationToken: state.captionTransitionToken || 0,
+          animationPhase: state.captionTransition ? 'incoming-only-entry' : 'idle',
+          outgoingLayerVisible: Boolean(state.controls.captionCurrent &&
+            state.controls.captionCurrent.textContent && state.captionTransition)
+        }
+        : null,
+      windows: windows
+    };
   }
 
   function readNativeCaptionText(state, renderer) {
@@ -1935,7 +2556,9 @@
         : String(rendererValue).replace(/[ \t]+/g, ' ').trim().slice(0, 8192);
     }
 
-    const values = activeWindows.map(readCaptionWindowText).filter(Boolean);
+    const values = activeWindows.map(function (captionWindow) {
+      return readCaptionWindowText(captionWindow, renderer);
+    }).filter(Boolean);
     if (captionUtils.normalizeCaptionLines) {
       return captionUtils.normalizeCaptionLines(values).slice(0, 8192);
     }
@@ -2172,7 +2795,7 @@
       const computedStyle = window.getComputedStyle(captionWindow);
       return {
         windowIndex: index,
-        windowText: readCaptionWindowText(captionWindow),
+        windowText: readCaptionWindowText(captionWindow, renderer),
         visible: isVisibleCaptionNode(captionWindow),
         opacity: computedStyle.opacity,
         ariaHidden: captionWindow.getAttribute('aria-hidden') || '',
@@ -2201,19 +2824,30 @@
     };
     state.captionLastMutationDebug = batchDebug;
     debugLog('Captions', 'mutationBatch', batchDebug);
+    const forensicSnapshot = buildCaptionForensicSnapshot(
+      state,
+      renderer,
+      mutations,
+      'mutation-callback'
+    );
+    state.captionLastForensicSnapshot = forensicSnapshot;
+    forensicLog('CaptionForensics', 'mutationBatch', forensicSnapshot);
   }
 
   function connectNativeCaptionObservers(state, info) {
     if (state.nativeCaptionRenderer !== info.renderer) {
+      cancelCaptionTransition(state, 'caption-renderer-changed');
       if (state.nativeCaptionObserver) {
         state.nativeCaptionObserver.disconnect();
         state.nativeCaptionObserver = null;
       }
       state.nativeCaptionRenderer = info.renderer || null;
+      resetRollupCaptionHistory(state, 'caption-renderer-changed');
       state.captionGeneration = 0;
       state.captionActiveWindows = new Set();
       state.captionWindowGenerations = new Map();
       state.captionLastMutationDebug = null;
+      state.captionLastForensicSnapshot = null;
 
       if (info.renderer && typeof MutationObserver === 'function') {
         state.nativeCaptionObserver = new MutationObserver(function (mutations) {
@@ -2228,7 +2862,9 @@
             captionEnabled: Boolean(state.nativeCaptionState && state.nativeCaptionState.enabled),
             fallbackUsed: false
           });
-          scheduleNativeCaptionMirrorUpdate(state);
+          // MutationObserver callbacks run after the whole native batch has applied.
+          // Resolve its final DOM once, so partial construction records cannot publish.
+          updateNativeCaptionMirror(state);
         });
         state.nativeCaptionObserver.observe(info.renderer, {
           subtree: true,
@@ -2245,6 +2881,11 @@
           observerActive: Boolean(state.nativeCaptionObserver),
           fallbackUsed: false
         });
+        forensicLog(
+          'CaptionForensics',
+          'observerConnected',
+          buildCaptionForensicSnapshot(state, info.renderer, [], 'observer-connected')
+        );
       }
     }
 
@@ -2265,6 +2906,423 @@
         });
       }
     }
+  }
+
+  function getCaptionLineList(text) {
+    if (captionUtils.getNormalizedCaptionLineList) {
+      return captionUtils.getNormalizedCaptionLineList(text);
+    }
+    return String(text || '').split('\n').map(function (line) {
+      return line.replace(/[ \t]+/g, ' ').trim();
+    }).filter(Boolean);
+  }
+
+  function getCaptionPaintCandidate(element) {
+    if (!element) {
+      return null;
+    }
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    const pseudo = ['::before', '::after'].map(function (selector) {
+      const pseudoStyle = window.getComputedStyle(element, selector);
+      return {
+        selector: selector,
+        content: pseudoStyle.content,
+        display: pseudoStyle.display,
+        visibility: pseudoStyle.visibility,
+        opacity: pseudoStyle.opacity,
+        backgroundColor: pseudoStyle.backgroundColor,
+        backgroundImage: pseudoStyle.backgroundImage,
+        width: pseudoStyle.width,
+        height: pseudoStyle.height
+      };
+    });
+    return {
+      tagName: element.tagName ? element.tagName.toLowerCase() : '',
+      className: typeof element.className === 'string' ? element.className : '',
+      text: String(element.textContent || '').slice(0, 1000),
+      childCount: element.childElementCount,
+      rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      display: style.display,
+      visibility: style.visibility,
+      opacity: style.opacity,
+      backgroundColor: style.backgroundColor,
+      backgroundImage: style.backgroundImage,
+      padding: style.padding,
+      minHeight: style.minHeight,
+      height: style.height,
+      boxShadow: style.boxShadow,
+      border: style.border,
+      overflow: style.overflow,
+      pseudo: pseudo
+    };
+  }
+
+  function logCaptionPaintForensics(state, reason, nativeText) {
+    if (!DEBUG_LOGGING || !state.controls) {
+      return;
+    }
+    const nativeCandidates = Array.from(document.querySelectorAll(
+      '.caption-window, .captions-text, .ytp-caption-segment'
+    )).slice(0, 100).map(getCaptionPaintCandidate).filter(Boolean);
+    const extensionCandidates = [
+      state.controls.captions,
+      state.controls.captionViewport,
+      state.controls.captionCurrent,
+      state.controls.captionIncoming
+    ].map(getCaptionPaintCandidate).filter(Boolean);
+    forensicLog('CaptionForensics', 'captionPaintForensics', {
+      reason: reason,
+      visibleOverlayCaption: state.captionVisualText || '',
+      authoritativeCaption: state.captionCommittedText || '',
+      finalMirroredCaptionText: nativeText || '',
+      activeWindowCount: state.captionActiveWindows ? state.captionActiveWindows.size : 0,
+      extensionBlackPaintCandidates: extensionCandidates,
+      nativeBlackPaintCandidates: nativeCandidates
+    });
+  }
+
+  function logCaptionVisualClear(state, phase, reason, nativeText) {
+    forensicLog('CaptionForensics', 'captionVisualClear' + phase, {
+      generation: state.captionGeneration,
+      videoCurrentTime: readVideoCurrentTime(state),
+      authoritativeCaption: state.captionCommittedText || '',
+      visibleOverlayCaption: state.captionVisualText || '',
+      renderedDomText: state.controls.captions.textContent || '',
+      finalMirroredCaptionText: nativeText || '',
+      activeNativeCaptionWindowCount: state.captionActiveWindows ? state.captionActiveWindows.size : 0,
+      clearReason: reason,
+      source: 'commitMirroredCaptionText',
+      previewToken: state.captionPreviewToken,
+      animationToken: state.captionTransitionToken,
+      atomicContext: state.rollupAtomicContext
+        ? { predecessorLines: state.rollupAtomicContext.predecessorLines, expectedSuccessorLines: state.rollupAtomicContext.expectedSuccessorLines }
+        : null
+    });
+  }
+
+  function commitMirroredCaptionText(state, text) {
+    if (!text) {
+      logCaptionVisualClear(state, 'Requested', 'native-empty', text);
+      logCaptionPaintForensics(state, 'before-native-empty-clear', text);
+    }
+    cancelCaptionTransition(state, 'direct-commit');
+    state.nativeCaptionText = text;
+    state.captionCommittedText = text;
+    state.captionVisualText = text;
+    state.captionIncomingText = '';
+    state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--rolling');
+    state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--incoming-ready');
+    state.controls.captionCurrent.textContent = text;
+    state.controls.captionIncoming.textContent = '';
+    state.controls.captions.hidden = !text;
+    if (!text) {
+      logCaptionVisualClear(state, 'Applied', 'native-empty', text);
+      logCaptionPaintForensics(state, 'after-native-empty-clear', text);
+    }
+  }
+
+  function getRollupGeometrySnapshot(state, renderer) {
+    const windows = Array.from(state.captionActiveWindows || []).filter(function (captionWindow) {
+      return captionWindow && renderer && renderer.contains(captionWindow) &&
+        isRollupCaptionWindow(captionWindow);
+    });
+    return windows.flatMap(function (captionWindow) {
+      return Array.from(captionWindow.querySelectorAll('.captions-text')).map(function (container) {
+        const rect = container.getBoundingClientRect();
+        return {
+          container: container,
+          window: captionWindow,
+          top: rect.top,
+          bottom: rect.bottom,
+          transform: window.getComputedStyle(container).transform || 'none',
+          lineRects: Array.from(container.querySelectorAll('.caption-visual-line')).map(function (line) {
+            const lineRect = line.getBoundingClientRect();
+            return { top: lineRect.top, bottom: lineRect.bottom };
+          })
+        };
+      });
+    });
+  }
+
+  function getTransformTranslateY(value) {
+    const matrix = String(value || '').match(/^matrix\(([^)]+)\)$/);
+    if (matrix) {
+      const values = matrix[1].split(',').map(Number);
+      return Number.isFinite(values[5]) ? values[5] : 0;
+    }
+    const translate = String(value || '').match(/translateY\(([-\d.]+)px\)/);
+    return translate && Number.isFinite(Number(translate[1])) ? Number(translate[1]) : 0;
+  }
+
+  function hasRollupGeometryMovedUpward(previous, current) {
+    return current.some(function (entry) {
+      const prior = previous.find(function (candidate) {
+        return candidate.container === entry.container;
+      });
+      if (!prior) {
+        return false;
+      }
+      return entry.top < prior.top - 0.25 ||
+        getTransformTranslateY(entry.transform) < getTransformTranslateY(prior.transform) - 0.25;
+    });
+  }
+
+  function cancelCaptionTransition(state, reason) {
+    const transition = state.captionTransition;
+    if (!transition) {
+      return;
+    }
+    if (state.captionTransitionTimer) {
+      window.clearTimeout(state.captionTransitionTimer);
+      state.captionTransitionTimer = 0;
+    }
+    if (state.captionTransitionRaf) {
+      window.cancelAnimationFrame(state.captionTransitionRaf);
+      state.captionTransitionRaf = 0;
+    }
+    state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--rolling');
+    state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--incoming-ready');
+    state.captionTransition = null;
+    state.captionTransitionToken += 1;
+    debugLog('Captions', 'captionTransitionCancelled', {
+      committedParagraph: transition.currentText,
+      nativeCandidate: transition.nativeCandidate,
+      incomingParagraph: transition.incomingText,
+      transitionToken: transition.token,
+      reason: reason
+    });
+  }
+
+  function completeCaptionTransition(state, transition, reason) {
+    if (activeOverlay !== state || state.captionTransition !== transition ||
+      (captionUtils.isCaptionTransitionCurrent
+        ? !captionUtils.isCaptionTransitionCurrent(transition.token, state.captionTransitionToken)
+        : state.captionTransitionToken !== transition.token)) {
+      return;
+    }
+    if (state.captionTransitionTimer) {
+      window.clearTimeout(state.captionTransitionTimer);
+      state.captionTransitionTimer = 0;
+    }
+    state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--rolling');
+    state.controls.captionCurrent.textContent = transition.incomingText;
+    state.controls.captionIncoming.textContent = '';
+    if (!transition.previewOnly) {
+      state.nativeCaptionText = transition.incomingText;
+      state.captionCommittedText = transition.incomingText;
+    }
+    state.captionVisualText = transition.incomingText;
+    state.captionIncomingText = '';
+    state.captionTransition = null;
+    debugLog('Captions', 'captionTransitionCompleted', {
+      committedParagraph: state.captionCommittedText,
+      nativeCandidate: transition.nativeCandidate,
+      incomingParagraph: '',
+      transitionToken: transition.token,
+      reason: reason
+    });
+  }
+
+  function startCaptionTransition(state, currentText, incomingText, nativeCandidate, reason, previewOnly) {
+    if (!incomingText || incomingText === currentText) {
+      commitMirroredCaptionText(state, incomingText || currentText);
+      return;
+    }
+    if (state.captionTransition && state.captionTransition.incomingText === incomingText) {
+      return;
+    }
+    if (state.captionTransition) {
+      cancelCaptionTransition(state, 'retargeted');
+    }
+    const token = ++state.captionTransitionToken;
+    const renderPlan = captionUtils.getIncomingOnlyCaptionRenderPlan
+      ? captionUtils.getIncomingOnlyCaptionRenderPlan(incomingText)
+      : { visibleText: incomingText, outgoingVisible: false, animationPhase: 'incoming-only-entry' };
+    const transition = {
+      token: token,
+      currentText: currentText,
+      incomingText: renderPlan.visibleText,
+      nativeCandidate: nativeCandidate,
+      previewOnly: previewOnly === true
+    };
+    state.captionTransition = transition;
+    if (!previewOnly) {
+      state.captionPreviousText = currentText;
+      state.nativeCaptionText = renderPlan.visibleText;
+      state.captionCommittedText = renderPlan.visibleText;
+    }
+    state.captionVisualText = renderPlan.visibleText;
+    state.captionIncomingText = renderPlan.visibleText;
+    state.controls.captionCurrent.textContent = '';
+    state.controls.captionIncoming.textContent = renderPlan.visibleText;
+    state.controls.captions.hidden = false;
+    const transitionHeight = Math.max(
+      state.controls.captionIncoming.offsetHeight
+    );
+    state.controls.captionViewport.style.setProperty(
+      '--ytpm-caption-transition-height',
+      Math.max(1, transitionHeight) + 'px'
+    );
+    state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--rolling');
+    state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--incoming-ready');
+    state.controls.captionViewport.classList.add('ytpm-overlay__caption-viewport--incoming-ready');
+    state.captionTransitionRaf = window.requestAnimationFrame(function () {
+      if (activeOverlay !== state || state.captionTransition !== transition ||
+        state.captionTransitionToken !== token) {
+        return;
+      }
+      state.captionTransitionRaf = 0;
+      state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--incoming-ready');
+      state.controls.captionViewport.classList.add('ytpm-overlay__caption-viewport--rolling');
+    });
+    debugLog('Captions', 'captionTransitionStarted', {
+      committedParagraph: currentText,
+      nativeCandidate: nativeCandidate,
+      incomingParagraph: incomingText,
+      transitionToken: token,
+      reason: reason,
+      rollup: true
+    });
+    state.captionTransitionTimer = window.setTimeout(function () {
+      completeCaptionTransition(state, transition, 'animation-fallback');
+    }, CAPTION_TRANSITION_DURATION_MS + 80);
+  }
+
+  function resetRollupCaptionHistory(state, reason) {
+    if (!state.captionPreviousText && !state.captionCommittedText && !state.rollupAtomicContext) {
+      return;
+    }
+    state.captionPreviousText = '';
+    state.captionPreviewToken += 1;
+    if (state.captionPreviewRaf) {
+      window.cancelAnimationFrame(state.captionPreviewRaf);
+      state.captionPreviewRaf = 0;
+    }
+    clearRollupAtomicContext(state, reason);
+    debugLog('Captions', 'rollupHistoryReset', {
+      videoId: state.videoId,
+      reason: reason
+    });
+  }
+
+  function getRawRollupCaptionText(state, renderer) {
+    const windows = Array.from(state.captionActiveWindows || []).filter(function (captionWindow) {
+      return captionWindow && renderer && renderer.contains(captionWindow) &&
+        isRollupCaptionWindow(captionWindow);
+    });
+    const values = windows.map(function (captionWindow) {
+      return typeof captionWindow.innerText === 'string'
+        ? captionWindow.innerText
+        : captionWindow.textContent || '';
+    });
+    return captionUtils.normalizeCaptionLines
+      ? captionUtils.normalizeCaptionLines(values)
+      : values.join('\n');
+  }
+
+  function clearRollupAtomicContext(state, reason) {
+    if (!state.rollupAtomicContext) {
+      return;
+    }
+    logRollupAtomicEvent(state, 'rollupAtomicContextCleared', {
+      predecessorLines: state.rollupAtomicContext.predecessorLines,
+      expectedSuccessorLines: state.rollupAtomicContext.expectedSuccessorLines,
+      generation: state.captionGeneration,
+      reason: reason
+    });
+    state.rollupAtomicContext = null;
+  }
+
+  function logRollupAtomicEvent(state, event, details) {
+    const payload = Object.assign({
+      generation: state.captionGeneration,
+      videoId: state.videoId,
+      videoCurrentTime: readVideoCurrentTime(state)
+    }, details || {});
+    debugLog('Captions', event, payload);
+    forensicLog('CaptionForensics', event, payload);
+  }
+
+  function updateRollupAtomicContext(state, committedText, rawRollupText) {
+    const expectedSuccessorLines = captionUtils.deriveTrailingRollupSuccessor
+      ? captionUtils.deriveTrailingRollupSuccessor(rawRollupText, committedText)
+      : [];
+    if (!expectedSuccessorLines.length) {
+      clearRollupAtomicContext(state, 'no-compatible-raw-successor');
+      return null;
+    }
+    const context = state.rollupAtomicContext;
+    const samePredecessor = context && context.predecessorText === committedText;
+    if (!samePredecessor) {
+      state.rollupAtomicContext = {
+        predecessorText: committedText,
+        predecessorLines: getCaptionLineList(committedText),
+        expectedSuccessorLines: expectedSuccessorLines
+      };
+      logRollupAtomicEvent(state, 'rollupAtomicContextStarted', {
+        predecessorLines: state.rollupAtomicContext.predecessorLines,
+        expectedSuccessorLines: expectedSuccessorLines,
+        rawRollupLines: getCaptionLineList(rawRollupText),
+        generation: state.captionGeneration
+      });
+    } else if (expectedSuccessorLines.join('\n') !== context.expectedSuccessorLines.join('\n')) {
+      context.expectedSuccessorLines = expectedSuccessorLines;
+      logRollupAtomicEvent(state, 'rollupExpectedSuccessorUpdated', {
+        predecessorLines: context.predecessorLines,
+        expectedSuccessorLines: expectedSuccessorLines,
+        rawRollupLines: getCaptionLineList(rawRollupText),
+        generation: state.captionGeneration
+      });
+    }
+    return state.rollupAtomicContext;
+  }
+
+  function scheduleRollupVisualPreview(state, rawRollupText) {
+    const context = state.rollupAtomicContext;
+    if (!context || state.captionVisualText === context.expectedSuccessorLines.join('\n')) {
+      return;
+    }
+    const token = ++state.captionPreviewToken;
+    const expectedText = context.expectedSuccessorLines.join('\n');
+    debugLog('Captions', 'rollupVisualPreviewScheduled', {
+      authoritativeCaption: state.captionCommittedText,
+      visualCaption: state.captionVisualText,
+      predecessorLines: context.predecessorLines,
+      expectedSuccessorLines: context.expectedSuccessorLines,
+      previewToken: token,
+      generation: state.captionGeneration,
+      reason: 'verified-raw-successor'
+    });
+    if (state.captionPreviewRaf) {
+      window.cancelAnimationFrame(state.captionPreviewRaf);
+    }
+    state.captionPreviewRaf = window.requestAnimationFrame(function () {
+      state.captionPreviewRaf = 0;
+      const latest = state.rollupAtomicContext;
+      if (activeOverlay !== state || token !== state.captionPreviewToken || !latest ||
+        latest.predecessorText !== context.predecessorText ||
+        latest.expectedSuccessorLines.join('\n') !== expectedText) {
+        return;
+      }
+      startCaptionTransition(
+        state,
+        state.captionCommittedText,
+        expectedText,
+        rawRollupText,
+        'rollup-visual-preview',
+        true
+      );
+      debugLog('Captions', 'rollupVisualPreviewStarted', {
+        authoritativeCaption: state.captionCommittedText,
+        visualCaption: expectedText,
+        predecessorLines: latest.predecessorLines,
+        expectedSuccessorLines: latest.expectedSuccessorLines,
+        previewToken: token,
+        generation: state.captionGeneration,
+        reason: 'one-frame-structural-validation'
+      });
+    });
   }
 
   function updateNativeCaptionMirror(state) {
@@ -2288,16 +3346,148 @@
     }
 
     const text = info.enabled ? info.text : '';
+    const previousText = state.captionCommittedText || state.nativeCaptionText;
+    const geometry = getRollupGeometrySnapshot(state, info.renderer);
+    const movedUpward = hasRollupGeometryMovedUpward(state.rollupLastGeometry || [], geometry);
+    state.rollupLastGeometry = geometry;
+    const rollup = geometry.length > 0;
+    if (!text) {
+      commitMirroredCaptionText(state, '');
+      resetRollupCaptionHistory(state, 'empty-caption');
+      return info;
+    }
+    const rawRollupText = rollup ? getRawRollupCaptionText(state, info.renderer) : '';
+    if (rollup && captionUtils.isRollupCaptionRollback &&
+      captionUtils.isRollupCaptionRollback(
+        text,
+        previousText,
+        state.captionPreviousText,
+        rawRollupText
+      )) {
+      logRollupAtomicEvent(state, 'rollupRollbackRejected', {
+        candidateCaption: text,
+        currentCommittedCaption: previousText,
+        previousSupersededCaption: state.captionPreviousText,
+        rawRollupLines: getCaptionLineList(rawRollupText),
+        rawRollupText: rawRollupText,
+        windowDebugId: Array.from(state.captionActiveWindows || []).map(getCaptionWindowDebugId),
+        videoId: state.videoId,
+        reason: 'previous-before-current-in-raw-rollup-context'
+      });
+      return info;
+    }
+    const atomicContext = rollup
+      ? updateRollupAtomicContext(state, previousText, rawRollupText)
+      : null;
+    if (atomicContext) {
+      scheduleRollupVisualPreview(state, rawRollupText);
+      const candidateIsCompleteSuccessor = captionUtils.isExactCaptionLineSequence &&
+        captionUtils.isExactCaptionLineSequence(text, atomicContext.expectedSuccessorLines);
+      const candidateIsPartialPredecessor = captionUtils.isCaptionLineFragment &&
+        captionUtils.isCaptionLineFragment(text, atomicContext.predecessorText);
+      const candidateIsPartialSuccessor = !candidateIsCompleteSuccessor &&
+        atomicContext.expectedSuccessorLines.length > 0 &&
+        getCaptionLineList(text).length > 0;
+      if (candidateIsPartialPredecessor || candidateIsPartialSuccessor) {
+        logRollupAtomicEvent(state, 'rollupFragmentRejected', {
+          candidateLines: getCaptionLineList(text),
+          committedLines: getCaptionLineList(previousText),
+          predecessorLines: atomicContext.predecessorLines,
+          expectedSuccessorLines: atomicContext.expectedSuccessorLines,
+          rawRollupLines: getCaptionLineList(rawRollupText),
+          geometryQualifiedRawLines: getCaptionLineList(text),
+          rejectionReason: candidateIsPartialPredecessor
+            ? 'partial-predecessor'
+            : 'partial-successor',
+          generation: state.captionGeneration,
+          windowDebugId: Array.from(state.captionActiveWindows || []).map(getCaptionWindowDebugId),
+          animationToken: state.captionTransitionToken
+        });
+        return info;
+      }
+      if (candidateIsCompleteSuccessor) {
+        logRollupAtomicEvent(state, 'rollupAtomicSuccessorCommitted', {
+          oldCompleteParagraph: previousText,
+          newCompleteParagraph: text,
+          rawRollupLines: getCaptionLineList(rawRollupText),
+          committedLines: getCaptionLineList(previousText),
+          expectedSuccessorLines: atomicContext.expectedSuccessorLines,
+          geometryCandidateLines: getCaptionLineList(text),
+          decision: 'accept',
+          reason: 'complete-successor-geometry-authoritative'
+        });
+        clearRollupAtomicContext(state, 'successor-committed');
+        if (state.captionVisualText === text) {
+          state.nativeCaptionText = text;
+          state.captionCommittedText = text;
+          state.captionPreviousText = previousText;
+          debugLog('Captions', 'rollupVisualPreviewReconciled', {
+            authoritativeCaption: text,
+            visualCaption: text,
+            previewToken: state.captionPreviewToken,
+            generation: state.captionGeneration,
+            reason: 'authoritative-successor-matches-preview'
+          });
+          return info;
+        }
+      }
+    }
+    if (text === previousText || (state.captionTransition &&
+      text === state.captionTransition.incomingText)) {
+      return info;
+    }
+    const transitionPlan = captionUtils.getRollupCaptionTransitionPlan
+      ? captionUtils.getRollupCaptionTransitionPlan(
+        previousText,
+        text,
+        rollup,
+        movedUpward
+      )
+      : {
+        transientSuperset: false,
+        incomingText: text
+      };
+    const isTransientSuperset = transitionPlan.transientSuperset === true;
+    const incomingText = transitionPlan.incomingText || text;
+    debugLog('Captions', 'captionTransitionDetected', {
+      committedParagraph: previousText,
+      nativeCandidate: text,
+      incomingParagraph: incomingText,
+      transitionToken: state.captionTransitionToken + 1,
+      reason: isTransientSuperset ? 'rollup-moving-superset' : 'caption-replacement',
+      rollup: rollup
+    });
+    if (rollup && previousText) {
+      startCaptionTransition(
+        state,
+        previousText,
+        incomingText,
+        text,
+        isTransientSuperset ? 'rollup-moving-superset' : 'rollup-replacement'
+      );
+      return info;
+    }
     const mirrorReplaced = state.nativeCaptionText !== text;
-    state.nativeCaptionText = text;
-    state.controls.captions.textContent = text;
-    state.controls.captions.hidden = !text;
+    commitMirroredCaptionText(state, text);
     if (state.captionLastMutationDebug) {
       state.captionLastMutationDebug.finalMirroredLines = text
         ? text.split('\n').length
         : 0;
       debugLog('Captions', 'mutationBatchFinal', state.captionLastMutationDebug);
       state.captionLastMutationDebug = null;
+    }
+    if (state.captionLastForensicSnapshot) {
+      forensicLog(
+        'CaptionForensics',
+        'mirrorUpdated',
+        buildCaptionForensicSnapshot(
+          state,
+          info.renderer,
+          [],
+          'mirror-updated'
+        )
+      );
+      state.captionLastForensicSnapshot = null;
     }
     debugLog('Captions', 'mirrorTextUpdated', {
       videoId: state.videoId,
@@ -2317,6 +3507,16 @@
   }
 
   function disposeNativeCaptionMirror(state) {
+    if (state.controls && state.controls.captions) {
+      logCaptionVisualClear(state, 'Requested', 'caption-mirror-disposed', '');
+      logCaptionPaintForensics(state, 'before-caption-mirror-disposed', '');
+    }
+    cancelCaptionTransition(state, 'caption-mirror-disposed');
+    state.captionPreviewToken += 1;
+    if (state.captionPreviewRaf) {
+      window.cancelAnimationFrame(state.captionPreviewRaf);
+      state.captionPreviewRaf = 0;
+    }
     if (state.nativeCaptionObserver) {
       state.nativeCaptionObserver.disconnect();
       state.nativeCaptionObserver = null;
@@ -2333,13 +3533,21 @@
     state.nativePreviewObserved = null;
     state.nativeCaptionState = null;
     state.nativeCaptionText = '';
+    state.captionCommittedText = '';
+    state.captionPreviousText = '';
+    state.rollupAtomicContext = null;
+    state.captionIncomingText = '';
     state.captionGeneration = 0;
     state.captionActiveWindows = new Set();
     state.captionWindowGenerations = new Map();
     state.captionLastMutationDebug = null;
+    state.captionLastForensicSnapshot = null;
     if (state.controls && state.controls.captions) {
-      state.controls.captions.textContent = '';
+      state.controls.captionCurrent.textContent = '';
+      state.controls.captionIncoming.textContent = '';
       state.controls.captions.hidden = true;
+      logCaptionVisualClear(state, 'Applied', 'caption-mirror-disposed', '');
+      logCaptionPaintForensics(state, 'after-caption-mirror-disposed', '');
     }
   }
 
@@ -3095,12 +4303,27 @@
 
     controls.seekInput.disabled = duration === 0;
     controls.seekInput.max = String(duration || 1);
+    const seekRangeValueBeforeSync = controls.seekInput.value;
     controls.seekInput.value = String(displayTime);
     controls.seekInput.style.setProperty(
       '--ytpm-seek-progress',
       (duration ? Math.min(100, (displayTime / duration) * 100) : 0) + '%'
     );
     controls.timeLabel.textContent = formatTime(displayTime) + ' / ' + formatTime(duration);
+    if (DEBUG_LOGGING && seekRangeValueBeforeSync !== controls.seekInput.value) {
+      forensicLog('SeekForensics', 'uiSynchronization', {
+        rangeValueBefore: seekRangeValueBeforeSync,
+        rangeValueAfter: controls.seekInput.value,
+        displayTime: displayTime,
+        videoCurrentTime: currentTime,
+        playerCurrentTime: readPlayerCurrentTime(state),
+        duration: duration,
+        state: getSeekInteractionStateSnapshot(state),
+        reason: state.seekDragging || state.seekPending
+          ? 'pending-time-preserved'
+          : 'playback-time-applied'
+      });
+    }
 
     updateCaptionControl(state);
     updateFullscreenControl(state);
@@ -3116,7 +4339,9 @@
     const frameRect = state.elements.frame.getBoundingClientRect();
     let percent;
     if (Number.isFinite(clientX) && rect.width > 0) {
-      percent = (clientX - rect.left) / rect.width;
+      const pointerPosition = captionUtils.getTimelinePointerPosition &&
+        captionUtils.getTimelinePointerPosition(clientX, rect.left, rect.width, duration);
+      percent = pointerPosition ? pointerPosition.percent : (clientX - rect.left) / rect.width;
     } else {
       const currentValue = Number(state.controls.seekInput.value);
       percent = currentValue / duration;
@@ -3552,6 +4777,274 @@
     };
   }
 
+  function getSeekRangeSnapshot(state) {
+    const range = state && state.controls && state.controls.seekInput;
+    if (!range) {
+      return null;
+    }
+
+    const rect = readForensicRect(range);
+    let valueAsNumber = null;
+    try {
+      valueAsNumber = Number.isFinite(range.valueAsNumber)
+        ? range.valueAsNumber
+        : null;
+    } catch (error) {
+      reportError('seek-forensics-value-as-number', error);
+    }
+    return {
+      value: range.value,
+      valueAsNumber: valueAsNumber,
+      min: range.min,
+      max: range.max,
+      step: range.step,
+      disabled: range.disabled,
+      rect: rect
+    };
+  }
+
+  function getSeekInteractionStateSnapshot(state) {
+    const pendingSeekTime = state && state.pendingSeekTime !== null &&
+      state.pendingSeekTime !== undefined && state.pendingSeekTime !== '' &&
+      Number.isFinite(Number(state.pendingSeekTime))
+      ? Number(state.pendingSeekTime)
+      : null;
+    const seekPointerId = state && state.seekPointerId !== null &&
+      state.seekPointerId !== undefined && state.seekPointerId !== '' &&
+      Number.isFinite(Number(state.seekPointerId))
+      ? Number(state.seekPointerId)
+      : null;
+    return {
+      seekDragging: Boolean(state && state.seekDragging),
+      seekPending: Boolean(state && state.seekPending),
+      pendingSeekTime: pendingSeekTime,
+      seekRequestId: state ? state.seekRequestId : 0,
+      seekInteractionId: state ? state.seekInteractionId : 0,
+      seekCommittedInteractionId: state ? state.seekCommittedInteractionId : 0,
+      seekPointerId: seekPointerId,
+      lastCommitSource: state && state.seekLastCommitSource
+        ? state.seekLastCommitSource
+        : ''
+    };
+  }
+
+  function getSeekPointerSnapshot(event, rangeSnapshot, duration) {
+    const clientX = event && Number.isFinite(Number(event.clientX))
+      ? Number(event.clientX)
+      : null;
+    const rect = rangeSnapshot && rangeSnapshot.rect;
+    let ratio = null;
+    let requestedTime = null;
+    if (clientX !== null && rect && rect.width > 0) {
+      ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      requestedTime = ratio * duration;
+    }
+
+    return {
+      clientX: clientX,
+      pageX: event && Number.isFinite(Number(event.pageX))
+        ? Number(event.pageX)
+        : null,
+      button: event && Number.isFinite(Number(event.button))
+        ? Number(event.button)
+        : null,
+      buttons: event && Number.isFinite(Number(event.buttons))
+        ? Number(event.buttons)
+        : null,
+      pointerId: event && Number.isFinite(Number(event.pointerId))
+        ? Number(event.pointerId)
+        : null,
+      pointerType: event && typeof event.pointerType === 'string'
+        ? event.pointerType
+        : '',
+      ratio: ratio,
+      requestedTimeFromGeometry: requestedTime
+    };
+  }
+
+  function getSeekForensicEventSequence(state, event) {
+    if (!state.seekForensicEventIds) {
+      state.seekForensicEventIds = new WeakMap();
+    }
+    if (!event || (typeof event !== 'object' && typeof event !== 'function')) {
+      state.seekForensicEventSequence += 1;
+      return state.seekForensicEventSequence;
+    }
+    if (!state.seekForensicEventIds.has(event)) {
+      state.seekForensicEventSequence += 1;
+      state.seekForensicEventIds.set(event, state.seekForensicEventSequence);
+    }
+    return state.seekForensicEventIds.get(event);
+  }
+
+  function buildSeekForensicEventSnapshot(state, event, phase) {
+    const range = getSeekRangeSnapshot(state);
+    const duration = getPreviewDuration(state);
+    const media = getSeekSnapshot(state);
+    return {
+      phase: phase,
+      eventSequence: getSeekForensicEventSequence(state, event),
+      eventType: event && event.type ? event.type : 'synthetic',
+      eventTimeStamp: event && Number.isFinite(Number(event.timeStamp))
+        ? Number(event.timeStamp)
+        : null,
+      isTrusted: Boolean(event && event.isTrusted),
+      defaultPrevented: Boolean(event && event.defaultPrevented),
+      targetTagName: event && event.target && event.target.tagName
+        ? event.target.tagName.toLowerCase()
+        : '',
+      targetClassName: readForensicClassName(event && event.target),
+      range: range,
+      pointer: getSeekPointerSnapshot(event, range, duration),
+      state: getSeekInteractionStateSnapshot(state),
+      video: {
+        currentTime: media.videoCurrentTime,
+        duration: media.videoDuration,
+        paused: Boolean(state.video && state.video.paused),
+        seeking: Boolean(state.video && state.video.seeking),
+        readyState: state.video ? state.video.readyState : null
+      },
+      player: {
+        currentTime: media.playerCurrentTime,
+        found: media.playerFound,
+        seekToAvailable: media.playerSeekToAvailable
+      },
+      bufferedRanges: media.bufferedRanges
+    };
+  }
+
+  function captureSeekForensicEvent(state, event) {
+    if (!DEBUG_LOGGING || !event) {
+      return;
+    }
+    if (!state.seekForensicCapturedEvents) {
+      state.seekForensicCapturedEvents = new WeakSet();
+    }
+    if (state.seekForensicCapturedEvents.has(event)) {
+      return;
+    }
+
+    state.seekForensicCapturedEvents.add(event);
+    const snapshot = buildSeekForensicEventSnapshot(state, event, 'before-handler');
+    if (!state.seekForensicEventBefore) {
+      state.seekForensicEventBefore = new WeakMap();
+    }
+    state.seekForensicEventBefore.set(event, snapshot);
+    forensicLog('SeekForensics', 'event', snapshot);
+    const eventSequence = snapshot.eventSequence;
+    const eventType = snapshot.eventType;
+    Promise.resolve().then(function () {
+      if (activeOverlay !== state) {
+        return;
+      }
+      forensicLog('SeekForensics', 'eventDispatchCompleted', {
+        eventSequence: eventSequence,
+        eventType: eventType,
+        stateBeforeHandler: snapshot.state,
+        rangeBeforeHandler: snapshot.range,
+        stateAfterDispatch: getSeekInteractionStateSnapshot(state),
+        rangeAfterDispatch: getSeekRangeSnapshot(state),
+        mediaAfterDispatch: getSeekSnapshot(state)
+      });
+    });
+  }
+
+  function logSeekForensicAction(state, event, action, details) {
+    if (!DEBUG_LOGGING) {
+      return;
+    }
+
+    const before = event && state.seekForensicEventBefore
+      ? state.seekForensicEventBefore.get(event) || null
+      : null;
+    forensicLog('SeekForensics', 'handlerAction', {
+      eventSequence: getSeekForensicEventSequence(state, event),
+      eventType: event && event.type ? event.type : 'synthetic',
+      action: action,
+      details: details || {},
+      stateBeforeHandler: before ? before.state : null,
+      rangeBeforeHandler: before ? before.range : null,
+      stateAfterHandler: getSeekInteractionStateSnapshot(state),
+      rangeAfterHandler: getSeekRangeSnapshot(state),
+      mediaAfterHandler: getSeekSnapshot(state)
+    });
+  }
+
+  function installSeekEventForensics(state) {
+    if (!DEBUG_LOGGING) {
+      return;
+    }
+
+    const range = state.controls.seekInput;
+    const eventTypes = [
+      'pointerdown',
+      'mousedown',
+      'input',
+      'change',
+      'pointerup',
+      'mouseup',
+      'click',
+      'pointercancel',
+      'lostpointercapture',
+      'keydown'
+    ];
+    eventTypes.forEach(function (eventType) {
+      registerListener(
+        state.controlCleanup,
+        document,
+        eventType,
+        function (event) {
+          const path = typeof event.composedPath === 'function'
+            ? event.composedPath()
+            : [];
+          const targetsRange = event.target === range || path.includes(range);
+          const closesActivePointer = (state.seekDragging ||
+            state.seekForensicGestureActive) && [
+            'pointerup',
+            'mouseup',
+            'pointercancel',
+            'lostpointercapture'
+          ].includes(eventType);
+          if (targetsRange || closesActivePointer) {
+            captureSeekForensicEvent(state, event);
+          }
+          if (eventType === 'mouseup' && state.seekForensicGestureActive) {
+            window.setTimeout(function () {
+              state.seekForensicGestureActive = false;
+            }, 0);
+          } else if (eventType === 'click' || eventType === 'pointercancel') {
+            state.seekForensicGestureActive = false;
+          }
+        },
+        true
+      );
+    });
+  }
+
+  function getManualSeekForensicSnapshot(label) {
+    const state = activeOverlay;
+    if (!state) {
+      const unavailable = {
+        label: String(label || '').slice(0, 200),
+        activeOverlay: false
+      };
+      forensicLog('SeekForensics', 'manualSnapshotUnavailable', unavailable);
+      return unavailable;
+    }
+
+    const snapshot = {
+      label: String(label || '').slice(0, 200),
+      activeOverlay: true,
+      videoId: state.videoId || '',
+      range: getSeekRangeSnapshot(state),
+      state: getSeekInteractionStateSnapshot(state),
+      media: getSeekSnapshot(state),
+      activeRequest: state.seekActiveForensicRequest || null
+    };
+    forensicLog('SeekForensics', 'manualSnapshot', snapshot);
+    return snapshot;
+  }
+
   function isCurrentSeekRequest(state, requestId) {
     if (captionUtils.isSeekRequestCurrent) {
       return captionUtils.isSeekRequestCurrent({
@@ -3618,13 +5111,25 @@
 
   function getSeekConfirmationStatus(state, request, snapshot) {
     const current = snapshot || getSeekSnapshot(state);
+    const visibleVideoAtTarget = isSeekWithinToleranceValue(
+      current.videoCurrentTime,
+      request.targetTime,
+      SEEK_CONFIRM_TOLERANCE
+    );
+    if (visibleVideoAtTarget) {
+      request.visibleVideoReachedTarget = true;
+    }
     if (captionUtils.getSeekConfirmationPlan) {
       return captionUtils.getSeekConfirmationPlan(
         request.playerControlled === true,
         current.playerCurrentTime,
         current.videoCurrentTime,
         request.targetTime,
-        SEEK_CONFIRM_TOLERANCE
+        SEEK_CONFIRM_TOLERANCE,
+        {
+          visibleVideoReachedTarget: request.visibleVideoReachedTarget === true,
+          preSeekVideoTime: request.before.videoCurrentTime
+        }
       );
     }
 
@@ -3642,6 +5147,8 @@
     return {
       playerConfirmed: playerConfirmed,
       videoConfirmed: videoConfirmed,
+      visibleVideoReachedTarget: request.visibleVideoReachedTarget === true || videoConfirmed,
+      snapback: false,
       confirmed: request.playerControlled === true
         ? playerConfirmed && (!videoAvailable || videoConfirmed)
         : videoAvailable
@@ -3670,21 +5177,35 @@
         : request.playerSeekToAvailable === true ||
           Boolean(bridgeResult && bridgeResult.seekToAvailable === true) ||
           current.playerSeekToAvailable,
+      playerAssociated: Boolean(bridgeResult && bridgeResult.playerAssociated === true),
+      videoAssociated: Boolean(bridgeResult && bridgeResult.videoAssociated === true),
+      usedVideoFallback: Boolean(bridgeResult && bridgeResult.usedVideoFallback === true),
       stage: request.stage || 'pending',
       allowSeekAhead: typeof request.allowSeekAhead === 'boolean'
         ? request.allowSeekAhead
         : null,
       videoCurrentTimeBefore: request.before.videoCurrentTime,
       videoCurrentTimeAfter: current.videoCurrentTime,
+      bridgeVideoCurrentTimeBefore: bridgeResult
+        ? bridgeResult.videoCurrentTimeBefore
+        : null,
+      bridgeVideoCurrentTimeAfter: bridgeResult
+        ? bridgeResult.videoCurrentTimeAfter
+        : null,
       playerCurrentTimeBefore: request.before.playerCurrentTime,
       playerCurrentTimeAfter: current.playerCurrentTime,
       videoDuration: current.videoDuration,
       metadataDuration: current.metadataDuration,
       bufferedRanges: current.bufferedRanges,
       requestId: request.requestId,
+      source: request.source || 'unknown',
+      sourceEventSequence: request.sourceEventSequence || null,
+      interactionId: request.interactionId || 0,
+      authoritativeCommitIndex: request.authoritativeCommitIndex || 0,
       controller: request.controller,
       playerConfirmed: confirmation.playerConfirmed,
       videoConfirmed: confirmation.videoConfirmed,
+      visibleVideoReachedTarget: confirmation.visibleVideoReachedTarget,
       confirmed: confirmation.confirmed,
       pendingCleared: state.seekPending === false,
       timeout: false,
@@ -3694,11 +5215,12 @@
   }
 
   function isPlayerSeekUsable(result) {
-    return Boolean(result && result.ok === true && result.seekToAvailable === true);
+    return Boolean(result && result.ok === true && result.seekToAvailable === true &&
+      result.playerAssociated === true);
   }
 
   function canFallbackToVideoSeek(result) {
-    return !result || result.playerFound !== true || result.seekToAvailable !== true;
+    return !result || result.playerAssociated !== true || result.ok !== true;
   }
 
   function invokeDirectPlayerSeek(state, request, allowSeekAhead, stage) {
@@ -3711,8 +5233,17 @@
 
     const playerCurrentTimeBefore = readPlayerCurrentTime(state);
     try {
+      forensicLog('SeekForensics', 'directPlayerSeekCall', {
+        requestId: request.requestId,
+        source: request.source,
+        target: request.targetTime,
+        stage: stage,
+        allowSeekAhead: allowSeekAhead === true,
+        playerCurrentTimeBefore: playerCurrentTimeBefore,
+        videoCurrentTimeBefore: readVideoCurrentTime(state)
+      });
       state.playerApi.seekTo(request.targetTime, allowSeekAhead === true);
-      return {
+      const result = {
         ok: true,
         available: true,
         playerFound: true,
@@ -3723,9 +5254,21 @@
         direct: true,
         stage: stage
       };
+      forensicLog('SeekForensics', 'directPlayerSeekReturn', {
+        requestId: request.requestId,
+        source: request.source,
+        target: request.targetTime,
+        stage: stage,
+        allowSeekAhead: allowSeekAhead === true,
+        playerCurrentTimeBefore: playerCurrentTimeBefore,
+        playerCurrentTimeAfter: result.playerCurrentTimeAfter,
+        videoCurrentTimeAfter: readVideoCurrentTime(state),
+        ok: true
+      });
+      return result;
     } catch (error) {
       reportError('seek-player-direct', error);
-      return {
+      const failedResult = {
         ok: false,
         available: true,
         playerFound: true,
@@ -3736,6 +5279,19 @@
         direct: true,
         stage: stage
       };
+      forensicLog('SeekForensics', 'directPlayerSeekReturn', {
+        requestId: request.requestId,
+        source: request.source,
+        target: request.targetTime,
+        stage: stage,
+        allowSeekAhead: allowSeekAhead === true,
+        playerCurrentTimeBefore: playerCurrentTimeBefore,
+        playerCurrentTimeAfter: failedResult.playerCurrentTimeAfter,
+        videoCurrentTimeAfter: readVideoCurrentTime(state),
+        ok: false,
+        errorName: error && error.name ? error.name : 'UnknownError'
+      });
+      return failedResult;
     }
   }
 
@@ -3744,11 +5300,26 @@
     request.allowSeekAhead = allowSeekAhead === true;
     const payload = {
       videoId: state.videoId,
+      videoAssociationId: state.seekAssociationId,
       seconds: request.targetTime,
       allowSeekAhead: request.allowSeekAhead
     };
+    if (DEBUG_LOGGING) {
+      payload.debugRequestId = request.requestId;
+      payload.debugSource = request.source;
+      payload.debugStage = stage;
+    }
 
     debugLog('Seek', 'playerSeekRequest', getSeekDebugDetails(
+      state,
+      request,
+      getSeekSnapshot(state),
+      {
+        bridgeOk: false,
+        seekCallIndex: request.seekCallCount + 1
+      }
+    ));
+    forensicLog('SeekForensics', 'bridgeSeekSent', getSeekDebugDetails(
       state,
       request,
       getSeekSnapshot(state),
@@ -3765,21 +5336,35 @@
       })
       .then(function (result) {
         if (!isCurrentSeekRequest(state, request.requestId)) {
+          forensicLog('SeekForensics', 'bridgeResponseIgnored', {
+            requestId: request.requestId,
+            source: request.source,
+            target: request.targetTime,
+            stage: stage,
+            reason: 'superseded-or-overlay-closed',
+            activeSeekRequestId: state.seekRequestId
+          });
           return null;
         }
-        if (!result || result.playerFound !== true ||
-          result.seekToAvailable !== true) {
-          const directResult = invokeDirectPlayerSeek(
-            state,
-            request,
-            allowSeekAhead,
-            stage
-          );
-          if (directResult) {
-            result = directResult;
-          }
-        }
-
+        forensicLog('SeekForensics', 'bridgeResponseReceived', {
+          requestId: request.requestId,
+          source: request.source,
+          target: request.targetTime,
+          stage: stage,
+          allowSeekAhead: allowSeekAhead === true,
+          responsePresent: Boolean(result),
+          bridgeOk: Boolean(result && result.ok === true),
+          playerFound: Boolean(result && result.playerFound === true),
+          seekToAvailable: Boolean(result && result.seekToAvailable === true),
+          bridgeTargetTime: result ? result.targetTime : null,
+          bridgePlayerCurrentTimeBefore: result
+            ? result.playerCurrentTimeBefore
+            : null,
+          bridgePlayerCurrentTimeAfter: result
+            ? result.playerCurrentTimeAfter
+            : null,
+          mediaAtReceipt: getSeekSnapshot(state)
+        });
         request.seekCallCount += 1;
         request.bridgeResult = result;
         request.playerFound = Boolean(result && result.playerFound === true);
@@ -3793,6 +5378,22 @@
           after,
           {
             bridgeOk: Boolean(result && result.ok === true),
+            seekCallIndex: request.seekCallCount,
+            bridgePlayerCurrentTimeBefore: result
+              ? result.playerCurrentTimeBefore
+              : null,
+            bridgePlayerCurrentTimeAfter: result
+              ? result.playerCurrentTimeAfter
+              : null
+          }
+        ));
+        forensicLog('SeekForensics', 'bridgeSeekResult', getSeekDebugDetails(
+          state,
+          request,
+          after,
+          {
+            bridgeOk: Boolean(result && result.ok === true),
+            bridgeResponsePresent: Boolean(result),
             seekCallIndex: request.seekCallCount,
             bridgePlayerCurrentTimeBefore: result
               ? result.playerCurrentTimeBefore
@@ -3828,11 +5429,7 @@
     const after = getSeekSnapshot(state);
     const confirmation = getSeekConfirmationStatus(state, request, after);
     const finalConfirmed = confirmation.confirmed;
-    const snapbackDetected = !finalConfirmed && (
-      (after.videoCurrentTime !== null && !confirmation.videoConfirmed) ||
-      (request.playerControlled === true &&
-        after.playerCurrentTime !== null && !confirmation.playerConfirmed)
-    );
+    const snapbackDetected = confirmation.snapback === true;
     state.seekPending = false;
     state.seekDragging = false;
     state.pendingSeekTime = null;
@@ -3849,6 +5446,20 @@
         snapbackDetected: snapbackDetected
       }
     ));
+    forensicLog('SeekForensics', 'pendingCleared', getSeekDebugDetails(
+      state,
+      request,
+      after,
+      {
+        confirmedArgument: confirmed === true,
+        confirmed: finalConfirmed,
+        reason: reason,
+        pendingCleared: true,
+        timeout: /timeout$/.test(String(reason || '')),
+        snapbackDetected: snapbackDetected
+      }
+    ));
+    state.seekActiveForensicRequest = null;
     scheduleVideoControlUpdate(state);
 
     if (finalConfirmed && request.restorePlayback !== false) {
@@ -3882,6 +5493,17 @@
         pendingCleared: false
       }
     ));
+    forensicLog('SeekForensics', 'videoFallback', getSeekDebugDetails(
+      state,
+      request,
+      getSeekSnapshot(state),
+      {
+        correctionReason: reason,
+        applied: applied,
+        videoFallbackIssued: request.videoFallbackIssued,
+        pendingCleared: false
+      }
+    ));
     return applied;
   }
 
@@ -3904,19 +5526,27 @@
         {
           pendingCleared: false,
           timeout: false,
-          snapbackDetected: !currentConfirmed && (
-            (current.videoCurrentTime !== null && !confirmation.videoConfirmed) ||
-            (request.playerControlled === true &&
-              current.playerCurrentTime !== null && !confirmation.playerConfirmed)
-          )
+          snapbackDetected: confirmation.snapback === true
         }
       ));
-      if (currentConfirmed || Date.now() >= deadline) {
+      forensicLog('SeekForensics', 'confirmationPoll', getSeekDebugDetails(
+        state,
+        request,
+        current,
+        {
+          pendingCleared: false,
+          timeout: false,
+          snapbackDetected: confirmation.snapback === true
+        }
+      ));
+      if (confirmation.snapback || currentConfirmed || Date.now() >= deadline) {
         finishSeekRequest(
           state,
           request,
           currentConfirmed,
-          currentConfirmed
+          confirmation.snapback
+            ? 'snapback'
+            : currentConfirmed
             ? 'confirmed'
             : 'timeout'
         );
@@ -3944,6 +5574,17 @@
         request.targetTime
       );
       debugLog('Seek', 'precisionStage', getSeekDebugDetails(
+        state,
+        request,
+        snapshot,
+        {
+          buffered: targetBuffered,
+          targetBuffered: targetBuffered,
+          precisionSeekIssued: request.precisionSeekIssued,
+          pendingCleared: false
+        }
+      ));
+      forensicLog('SeekForensics', 'precisionStagePoll', getSeekDebugDetails(
         state,
         request,
         snapshot,
@@ -3990,6 +5631,17 @@
 
             request.precisionCorrectionApplied = true;
             debugLog('Seek', 'precisionCommit', getSeekDebugDetails(
+              state,
+              request,
+              getSeekSnapshot(state),
+              {
+                bridgeOk: true,
+                precisionSeekIssued: request.precisionSeekIssued,
+                precisionCorrectionApplied: request.precisionCorrectionApplied,
+                pendingCleared: false
+              }
+            ));
+            forensicLog('SeekForensics', 'precisionCommit', getSeekDebugDetails(
               state,
               request,
               getSeekSnapshot(state),
@@ -4054,6 +5706,9 @@
     const rangeValue = options && options.rangeValue !== undefined
       ? options.rangeValue
       : numericTime;
+    const source = options && typeof options.source === 'string'
+      ? options.source.slice(0, 80)
+      : 'unknown';
     const wasPaused = state.video.paused || state.video.ended;
     const requestId = ++state.seekRequestId;
     clearSeekConfirmationTimer(state);
@@ -4063,6 +5718,14 @@
     state.pendingSeekTime = targetTime;
     const request = {
       requestId: requestId,
+      source: source,
+      sourceEventSequence: options && Number.isFinite(Number(options.eventSequence))
+        ? Number(options.eventSequence)
+        : null,
+      interactionId: options && Number.isFinite(Number(options.interactionId))
+        ? Number(options.interactionId)
+        : state.seekInteractionId,
+      authoritativeCommitIndex: ++state.seekAuthoritativeCommitCount,
       rangeValue: Number.isFinite(Number(rangeValue)) ? Number(rangeValue) : null,
       targetTime: targetTime,
       before: before,
@@ -4080,10 +5743,23 @@
       precisionCorrectionApplied: false,
       videoFallbackIssued: false,
       videoFallbackApplied: false,
+      visibleVideoReachedTarget: false,
       restorePlayback: true
     };
+    state.seekLastCommitSource = source;
+    state.seekActiveForensicRequest = request;
 
     scheduleVideoControlUpdate(state);
+    forensicLog('SeekForensics', 'authoritativeCommitCreated', getSeekDebugDetails(
+      state,
+      request,
+      before,
+      {
+        inputRequestedTime: numericTime,
+        shouldSeek: seekPlan.shouldSeek,
+        pendingCleared: false
+      }
+    ));
 
     if (!seekPlan.shouldSeek || isSeekNoOpValue(currentTimeForPlan, targetTime)) {
       request.restorePlayback = false;
@@ -4092,6 +5768,12 @@
     }
 
     debugLog('Seek', 'request', getSeekDebugDetails(
+      state,
+      request,
+      before,
+      { pendingCleared: false }
+    ));
+    forensicLog('SeekForensics', 'requestLifecycleStarted', getSeekDebugDetails(
       state,
       request,
       before,
@@ -4118,12 +5800,28 @@
           return;
         }
 
+        if (result && result.ok === true && result.usedVideoFallback === true &&
+          result.videoAssociated === true) {
+          request.controller = 'video-associated-fallback';
+          confirmSeekRequest(state, request);
+          return;
+        }
+
         if (isPlayerSeekUsable(result)) {
           request.playerControlled = true;
           request.controller = request.targetBuffered
             ? 'player-buffered'
             : 'player-load';
           debugLog('Seek', 'commit', getSeekDebugDetails(
+            state,
+            request,
+            getSeekSnapshot(state),
+            {
+              bridgeOk: true,
+              pendingCleared: false
+            }
+          ));
+          forensicLog('SeekForensics', 'playerCommitAccepted', getSeekDebugDetails(
             state,
             request,
             getSeekSnapshot(state),
@@ -4153,6 +5851,16 @@
           ? 'player-unavailable'
           : 'bridge-unavailable');
         debugLog('Seek', 'commit', getSeekDebugDetails(
+          state,
+          request,
+          getSeekSnapshot(state),
+          {
+            bridgeOk: false,
+            applied: applied,
+            pendingCleared: false
+          }
+        ));
+        forensicLog('SeekForensics', 'videoFallbackCommit', getSeekDebugDetails(
           state,
           request,
           getSeekSnapshot(state),
@@ -4193,7 +5901,35 @@
     );
   }
 
-  function beginSeekInteraction(state, event) {
+  function updatePointerSeekTarget(state, event) {
+    if (!state.seekDragging || !event || !Number.isFinite(Number(event.clientX))) {
+      return null;
+    }
+    if (state.seekPointerId !== null && Number.isFinite(event.pointerId) &&
+      event.pointerId !== state.seekPointerId) {
+      return null;
+    }
+    const position = getTimelineHoverPosition(state, Number(event.clientX));
+    if (!position || !Number.isFinite(position.seconds)) {
+      return null;
+    }
+    state.seekPointerTarget = position.seconds;
+    state.pendingSeekTime = position.seconds;
+    return position;
+  }
+
+  function beginSeekInteraction(state, event, source) {
+    const previousState = getSeekInteractionStateSnapshot(state);
+    if (state.seekActiveForensicRequest) {
+      forensicLog('SeekForensics', 'requestSuperseded', {
+        requestId: state.seekActiveForensicRequest.requestId,
+        source: state.seekActiveForensicRequest.source,
+        target: state.seekActiveForensicRequest.targetTime,
+        reason: 'new-seek-interaction',
+        stateBeforeClear: previousState
+      });
+      state.seekActiveForensicRequest = null;
+    }
     clearSeekConfirmationTimer(state);
     state.seekConfirmationCheck = null;
     state.seekRequestId += 1;
@@ -4201,34 +5937,81 @@
     state.seekCommittedInteractionId = 0;
     state.seekDragging = true;
     state.seekPending = true;
+    state.seekPointerTarget = null;
     state.pendingSeekTime = readSeekInputTarget(state);
     state.seekPointerId = event && Number.isFinite(event.pointerId)
       ? event.pointerId
       : null;
+    state.seekLastInteractionSource = String(source || 'unknown').slice(0, 80);
+    if (event && event.type === 'pointerdown') {
+      state.seekForensicGestureActive = true;
+      updatePointerSeekTarget(state, event);
+    }
     scheduleVideoControlUpdate(state);
+    forensicLog('SeekForensics', 'interactionBegan', {
+      source: state.seekLastInteractionSource,
+      eventSequence: getSeekForensicEventSequence(state, event),
+      eventType: event && event.type ? event.type : 'synthetic',
+      range: getSeekRangeSnapshot(state),
+      previousState: previousState,
+      state: getSeekInteractionStateSnapshot(state),
+      media: getSeekSnapshot(state)
+    });
   }
 
-  function commitSeekInteraction(state) {
+  function commitSeekInteraction(state, event, source) {
+    const commitSource = String(source || 'unknown').slice(0, 80);
     if (!state.seekDragging && !state.seekPending) {
-      beginSeekInteraction(state, null);
+      beginSeekInteraction(state, event || null, commitSource + '-implicit-begin');
     }
 
-    const targetTime = Number.isFinite(Number(state.pendingSeekTime))
-      ? state.pendingSeekTime
+    const inputPlan = captionUtils.getPointerSeekInputPlan
+      ? captionUtils.getPointerSeekInputPlan(
+        state.seekPointerId !== null,
+        state.seekPointerTarget,
+        readSeekInputTarget(state)
+      )
+      : { targetTime: state.pendingSeekTime, source: 'pending' };
+    const targetTime = Number.isFinite(Number(inputPlan.targetTime))
+      ? inputPlan.targetTime
       : readSeekInputTarget(state);
     state.pendingSeekTime = targetTime;
     state.seekDragging = false;
-    if (state.seekCommittedInteractionId === state.seekInteractionId) {
+    const shouldCommit = captionUtils.shouldCommitSeekInteraction
+      ? captionUtils.shouldCommitSeekInteraction(
+        state.seekInteractionId,
+        state.seekCommittedInteractionId
+      )
+      : state.seekCommittedInteractionId !== state.seekInteractionId;
+    if (!shouldCommit) {
       state.seekPointerId = null;
+      logSeekForensicAction(state, event, 'ignored-duplicate-commit', {
+        source: commitSource,
+        target: targetTime,
+        interactionId: state.seekInteractionId
+      });
       return;
     }
 
     state.seekCommittedInteractionId = state.seekInteractionId;
     state.seekPointerId = null;
-    seekPreviewTo(state, targetTime, { rangeValue: state.controls.seekInput.value });
+    state.seekPointerTarget = null;
+    logSeekForensicAction(state, event, 'authoritative-commit-requested', {
+      source: commitSource,
+      target: targetTime,
+      targetSource: inputPlan.source,
+      interactionId: state.seekInteractionId
+    });
+    seekPreviewTo(state, targetTime, {
+      rangeValue: targetTime,
+      source: commitSource,
+      eventSequence: getSeekForensicEventSequence(state, event),
+      interactionId: state.seekInteractionId
+    });
   }
 
-  function cancelSeekInteraction(state) {
+  function cancelSeekInteraction(state, event, source) {
+    const previousState = getSeekInteractionStateSnapshot(state);
     clearSeekConfirmationTimer(state);
     state.seekConfirmationCheck = null;
     state.seekRequestId += 1;
@@ -4237,10 +6020,26 @@
     state.pendingSeekTime = null;
     state.seekConfirmationCheck = null;
     state.seekPointerId = null;
+    state.seekPointerTarget = null;
+    state.seekActiveForensicRequest = null;
     scheduleVideoControlUpdate(state);
+    logSeekForensicAction(state, event, 'interaction-cancelled', {
+      source: String(source || 'unknown').slice(0, 80),
+      previousState: previousState
+    });
+    forensicLog('SeekForensics', 'pendingCleared', {
+      requestId: previousState.seekRequestId,
+      source: String(source || 'unknown').slice(0, 80),
+      target: previousState.pendingSeekTime,
+      reason: 'cancelled',
+      pendingCleared: true,
+      stateBeforeClear: previousState,
+      stateAfterClear: getSeekInteractionStateSnapshot(state),
+      mediaAfterClear: getSeekSnapshot(state)
+    });
   }
 
-  function seekVideoBy(state, amount) {
+  function seekVideoBy(state, amount, options) {
     if (!state.video || !state.video.isConnected) {
       return;
     }
@@ -4258,7 +6057,12 @@
     }
 
     seekPreviewTo(state, currentTime + Number(amount || 0), {
-      rangeValue: currentTime + Number(amount || 0)
+      rangeValue: currentTime + Number(amount || 0),
+      source: options && options.source ? options.source : 'overlay-keyboard',
+      eventSequence: options && options.event
+        ? getSeekForensicEventSequence(state, options.event)
+        : null,
+      interactionId: state.seekInteractionId
     });
   }
 
@@ -4565,11 +6369,23 @@
     ];
 
     videoEvents.forEach(function (eventName) {
-      registerListener(state.videoControlCleanup, state.video, eventName, function () {
+      registerListener(state.videoControlCleanup, state.video, eventName, function (event) {
+        const traceSeekMediaEvent = DEBUG_LOGGING && (
+          state.seekPending || state.seekDragging ||
+          eventName === 'seeking' || eventName === 'seeked'
+        );
+        if (traceSeekMediaEvent) {
+          captureSeekForensicEvent(state, event);
+        }
+        if (eventName === 'seeking') {
+          resetRollupCaptionHistory(state, 'video-seeking');
+        }
         scheduleVideoControlUpdate(state);
+        let confirmationCheckInvoked = false;
         if (state.seekPending && state.seekConfirmationCheck &&
           (eventName === 'timeupdate' || eventName === 'seeking' ||
             eventName === 'seeked')) {
+          confirmationCheckInvoked = true;
           state.seekConfirmationCheck();
         }
         if (eventName === 'timeupdate' || eventName === 'seeking' ||
@@ -4581,8 +6397,17 @@
           state.timelineHovering) {
           updateTimelinePreview(state, state.timelineHoverClientX);
         }
+        if (traceSeekMediaEvent) {
+          logSeekForensicAction(state, event, 'media-event-processed', {
+            eventName: eventName,
+            uiUpdateScheduled: true,
+            confirmationCheckInvoked: confirmationCheckInvoked
+          });
+        }
       });
     });
+
+    installSeekEventForensics(state);
 
     ['pointermove', 'pointerenter', 'pointerdown', 'touchstart', 'focusin'].forEach(function (eventName) {
       registerListener(state.controlCleanup, state.elements.frame, eventName, function () {
@@ -4619,11 +6444,18 @@
       updateTimelinePreview(state, event.clientX);
     });
     registerListener(state.controlCleanup, state.controls.seekInput, 'pointermove', function (event) {
+      updatePointerSeekTarget(state, event);
       updateTimelinePreview(state, event.clientX);
     });
     registerListener(state.controlCleanup, state.controls.seekInput, 'pointerdown', function (event) {
-      beginSeekInteraction(state, event);
+      captureSeekForensicEvent(state, event);
+      beginSeekInteraction(state, event, 'pointerdown');
       updateTimelinePreview(state, event.clientX);
+      logSeekForensicAction(state, event, 'pending-stored', {
+        source: 'pointerdown',
+        target: state.pendingSeekTime,
+        uiOnly: true
+      });
     });
     registerListener(state.controlCleanup, state.controls.seekInput, 'pointerleave', function () {
       hideTimelinePreview(state);
@@ -4631,36 +6463,73 @@
     registerListener(state.controlCleanup, state.controls.seekInput, 'focus', function () {
       updateTimelinePreview(state, null);
     });
-    registerListener(state.controlCleanup, state.controls.seekInput, 'blur', function () {
+    registerListener(state.controlCleanup, state.controls.seekInput, 'blur', function (event) {
+      captureSeekForensicEvent(state, event);
       if (state.seekDragging) {
-        commitSeekInteraction(state);
+        commitSeekInteraction(state, event, 'range-blur');
+      } else {
+        logSeekForensicAction(state, event, 'no-seek-action', {
+          source: 'range-blur',
+          reason: 'not-dragging'
+        });
       }
       hideTimelinePreview(state);
     });
-    registerListener(state.controlCleanup, state.controls.seekInput, 'input', function () {
+    registerListener(state.controlCleanup, state.controls.seekInput, 'input', function (event) {
+      captureSeekForensicEvent(state, event);
+      const previousPendingSeekTime = state.pendingSeekTime;
       if (!state.seekDragging) {
-        beginSeekInteraction(state, null);
+        beginSeekInteraction(state, event, 'range-input');
       }
 
-      state.pendingSeekTime = readSeekInputTarget(state);
+      if (state.seekPointerId === null ||
+        !Number.isFinite(Number(state.seekPointerTarget))) {
+        state.pendingSeekTime = readSeekInputTarget(state);
+      }
       state.seekPending = true;
       updateTimelinePreview(state, state.timelineHoverClientX);
       scheduleVideoControlUpdate(state);
+      logSeekForensicAction(state, event, 'ui-preview-only', {
+        source: 'range-input',
+        previousPendingSeekTime: previousPendingSeekTime !== null &&
+          previousPendingSeekTime !== undefined && previousPendingSeekTime !== '' &&
+          Number.isFinite(Number(previousPendingSeekTime))
+          ? Number(previousPendingSeekTime)
+          : null,
+        pendingSeekTime: state.pendingSeekTime,
+        commitRequested: false
+      });
     });
-    registerListener(state.controlCleanup, state.controls.seekInput, 'change', function () {
-      commitSeekInteraction(state);
+    registerListener(state.controlCleanup, state.controls.seekInput, 'change', function (event) {
+      captureSeekForensicEvent(state, event);
+      commitSeekInteraction(state, event, 'range-change');
     });
-    registerListener(state.controlCleanup, state.controls.seekInput, 'pointercancel', function () {
-      cancelSeekInteraction(state);
+    registerListener(state.controlCleanup, state.controls.seekInput, 'pointercancel', function (event) {
+      captureSeekForensicEvent(state, event);
+      cancelSeekInteraction(state, event, 'pointercancel');
       hideTimelinePreview(state);
     });
     registerListener(state.controlCleanup, document, 'pointerup', function (event) {
+      const eventPath = typeof event.composedPath === 'function'
+        ? event.composedPath()
+        : [];
+      const targetsRange = event.target === state.controls.seekInput ||
+        eventPath.includes(state.controls.seekInput);
+      if (!state.seekDragging && !targetsRange) {
+        return;
+      }
+      captureSeekForensicEvent(state, event);
       if (!state.seekDragging ||
         (state.seekPointerId !== null && Number.isFinite(event.pointerId) &&
           event.pointerId !== state.seekPointerId)) {
+        logSeekForensicAction(state, event, 'pointerup-ignored', {
+          source: 'pointerup',
+          reason: !state.seekDragging ? 'not-dragging' : 'pointer-id-mismatch'
+        });
         return;
       }
-      commitSeekInteraction(state);
+      updatePointerSeekTarget(state, event);
+      commitSeekInteraction(state, event, 'pointerup');
     });
     registerListener(state.controlCleanup, state.controls.qualityButton, 'click', function () {
       showOverlayControls(state);
@@ -4782,6 +6651,8 @@
 
     const settings = Object.assign({ restoreFocus: true }, options);
     const state = activeOverlay;
+    const seekStateBeforeClose = getSeekInteractionStateSnapshot(state);
+    const seekRequestBeforeClose = state.seekActiveForensicRequest;
     activeOverlay = null;
 
     window.removeEventListener('keydown', state.handleKeydown, true);
@@ -4820,6 +6691,30 @@
     state.seekPending = false;
     state.pendingSeekTime = null;
     state.seekPointerId = null;
+    state.seekPointerTarget = null;
+    state.seekActiveForensicRequest = null;
+    clearSeekAssociation(state);
+    if (DEBUG_LOGGING && (
+      seekStateBeforeClose.seekPending || seekStateBeforeClose.seekDragging ||
+      seekRequestBeforeClose
+    )) {
+      forensicLog('SeekForensics', 'pendingCleared', {
+        requestId: seekRequestBeforeClose
+          ? seekRequestBeforeClose.requestId
+          : seekStateBeforeClose.seekRequestId,
+        source: seekRequestBeforeClose
+          ? seekRequestBeforeClose.source
+          : state.seekLastInteractionSource,
+        target: seekRequestBeforeClose
+          ? seekRequestBeforeClose.targetTime
+          : seekStateBeforeClose.pendingSeekTime,
+        reason: 'overlay-closed',
+        pendingCleared: true,
+        stateBeforeClear: seekStateBeforeClose,
+        stateAfterClear: getSeekInteractionStateSnapshot(state),
+        mediaAfterClear: getSeekSnapshot(state)
+      });
+    }
     hideTimelinePreview(state);
     state.captionRequestId += 1;
     disposeNativeCaptionMirror(state);
@@ -4970,18 +6865,33 @@
       videoControlCleanup: [],
       qualityOptionCleanup: [],
       playerApi: playerApi,
+      seekAssociationId: '',
+      seekAssociatedPlayerElement: null,
       nativePreview: activePreview,
       nativeCaptionObserver: null,
       nativePreviewObserver: null,
       nativePreviewObserved: null,
       nativeCaptionRenderer: null,
       nativeCaptionSyncTimer: 0,
+      rollupLastGeometry: [],
+      rollupAtomicContext: null,
+      captionCommittedText: '',
+      captionVisualText: '',
+      captionPreviousText: '',
+      captionIncomingText: '',
+      captionTransitionToken: 0,
+      captionTransitionRaf: 0,
+      captionTransitionTimer: 0,
+      captionTransition: null,
+      captionPreviewToken: 0,
+      captionPreviewRaf: 0,
       nativeCaptionState: null,
       nativeCaptionText: '',
       captionGeneration: 0,
       captionActiveWindows: new Set(),
       captionWindowGenerations: new Map(),
       captionLastMutationDebug: null,
+      captionLastForensicSnapshot: null,
       captionInfo: null,
       captionCatalog: null,
       captionCatalogLoaded: false,
@@ -5018,6 +6928,16 @@
       seekInteractionId: 0,
       seekCommittedInteractionId: 0,
       seekPointerId: null,
+      seekPointerTarget: null,
+      seekAuthoritativeCommitCount: 0,
+      seekLastInteractionSource: '',
+      seekLastCommitSource: '',
+      seekActiveForensicRequest: null,
+      seekForensicEventSequence: 0,
+      seekForensicEventIds: new WeakMap(),
+      seekForensicCapturedEvents: new WeakSet(),
+      seekForensicEventBefore: new WeakMap(),
+      seekForensicGestureActive: false,
       inertedElements: [],
       userPaused: false
     };
@@ -5087,7 +7007,10 @@
       if (isArrowLeft || isArrowRight) {
         event.preventDefault();
         event.stopPropagation();
-        seekVideoBy(state, isArrowLeft ? -5 : 5);
+        seekVideoBy(state, isArrowLeft ? -5 : 5, {
+          source: 'overlay-keyboard',
+          event: event
+        });
       } else if (isSpace || key === 'k' || code === 'KeyK') {
         event.preventDefault();
         event.stopPropagation();
@@ -5124,6 +7047,7 @@
     };
 
     try {
+      markSeekAssociation(state);
       originParent.insertBefore(placeholder, mediaRoot);
       document.body.appendChild(elements.overlay);
       video.classList.add(VIDEO_CLASS);
@@ -5158,6 +7082,7 @@
       if (activeOverlay === state) {
         closePreviewOverlay({ restoreFocus: false });
       } else {
+        clearSeekAssociation(state);
         if (state.placeholder.isConnected) {
           state.placeholder.replaceWith(mediaRoot);
         } else if (mediaRoot.parentNode !== originParent && originParent.isConnected) {
@@ -5281,12 +7206,101 @@
     }
   }
 
+  function getManualCaptionForensicSnapshot(label) {
+    const state = activeOverlay;
+    const info = state ? readNativeCaptionState(state) : null;
+    const renderer = state && state.nativeCaptionRenderer || info && info.renderer;
+    if (!state || !renderer) {
+      const unavailable = {
+        label: String(label || '').slice(0, 200),
+        activeOverlay: Boolean(state),
+        captionRendererFound: Boolean(renderer)
+      };
+      forensicLog('CaptionForensics', 'manualSnapshotUnavailable', unavailable);
+      return unavailable;
+    }
+
+    const snapshot = buildCaptionForensicSnapshot(
+      state,
+      renderer,
+      [],
+      'manual-' + String(label || 'snapshot').slice(0, 80)
+    );
+    forensicLog('CaptionForensics', 'manualSnapshot', snapshot);
+    return snapshot;
+  }
+
+  function installForensicDebugHelpers() {
+    if (!DEBUG_LOGGING || forensicHelpersInstalled) {
+      return;
+    }
+
+    forensicHelpersInstalled = true;
+    const readLabel = function (event) {
+      try {
+        return event && event.detail && typeof event.detail.label === 'string'
+          ? event.detail.label.slice(0, 200)
+          : '';
+      } catch (error) {
+        return '';
+      }
+    };
+    const helpers = Object.freeze({
+      captionSnapshot: getManualCaptionForensicSnapshot,
+      seekSnapshot: getManualSeekForensicSnapshot,
+      export: function () {
+        return forensicLogBuffer.slice();
+      },
+      exportJson: function () {
+        return serializeForensicBuffer();
+      },
+      clear: function () {
+        forensicLogBuffer.splice(0, forensicLogBuffer.length);
+      }
+    });
+
+    try {
+      Object.defineProperty(globalThis, '__YTPMForensics', {
+        configurable: true,
+        enumerable: false,
+        value: helpers
+      });
+    } catch (error) {
+      reportError('forensics-helper-install', error);
+    }
+
+    window.addEventListener('ytpm-debug-caption-snapshot', function (event) {
+      getManualCaptionForensicSnapshot(readLabel(event));
+    });
+    window.addEventListener('ytpm-debug-seek-snapshot', function (event) {
+      getManualSeekForensicSnapshot(readLabel(event));
+    });
+    window.addEventListener('ytpm-debug-dump', function () {
+      const data = forensicLogBuffer.slice();
+      console.debug('[YTPM][ForensicsJSON]\n' + JSON.stringify(data, null, 2));
+    });
+    window.addEventListener('ytpm-debug-clear', function () {
+      forensicLogBuffer.splice(0, forensicLogBuffer.length);
+      console.debug('[YTPM][ForensicsDump]', 'cleared');
+    });
+    forensicLog('Forensics', 'helpersReady', {
+      extensionContextHelper: '__YTPMForensics',
+      pageContextEvents: [
+        'ytpm-debug-caption-snapshot',
+        'ytpm-debug-seek-snapshot',
+        'ytpm-debug-dump',
+        'ytpm-debug-clear'
+      ]
+    });
+  }
+
   function initialize() {
     if (initialized) {
       return;
     }
 
     initialized = true;
+    installForensicDebugHelpers();
     injectPageBridge();
     scanCards(document);
     startObserver();

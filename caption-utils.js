@@ -76,6 +76,109 @@
     return lines.join('\n');
   }
 
+  function getNormalizedCaptionLineList(value) {
+    const normalized = normalizeCaptionLines(value);
+    return normalized ? normalized.split('\n') : [];
+  }
+
+  function isStrictCaptionLineSuperset(previousLines, candidateLines) {
+    const previous = getNormalizedCaptionLineList(previousLines);
+    const candidate = getNormalizedCaptionLineList(candidateLines);
+    return previous.length > 0 && candidate.length > previous.length &&
+      previous.every(function (line) {
+        return candidate.includes(line);
+      });
+  }
+
+  function getRollupCaptionTransitionPlan(committedText, candidateText, isRollup, movedUpward) {
+    const committedLines = getNormalizedCaptionLineList(committedText);
+    const candidateLines = getNormalizedCaptionLineList(candidateText);
+    const candidate = candidateLines.join('\n');
+    const committed = committedLines.join('\n');
+    const transientSuperset = isRollup === true && movedUpward === true &&
+      isStrictCaptionLineSuperset(committedLines, candidateLines);
+    return {
+      shouldTransition: Boolean(committed && candidate && candidate !== committed),
+      transientSuperset: transientSuperset,
+      currentText: committed,
+      incomingText: transientSuperset
+        ? candidateLines.slice(committedLines.length).join('\n')
+        : candidate
+    };
+  }
+
+  function isCaptionTransitionCurrent(token, currentToken) {
+    return Number.isInteger(Number(token)) && Number(token) >= 0 &&
+      Number(token) === Number(currentToken);
+  }
+
+  function getIncomingOnlyCaptionRenderPlan(authoritativeText) {
+    const visibleText = normalizeCaptionLines(authoritativeText);
+    return {
+      visibleText: visibleText,
+      outgoingVisible: false,
+      animationPhase: visibleText ? 'incoming-only-entry' : 'idle'
+    };
+  }
+
+  function findCaptionLineSequence(rawLines, paragraphLines, startIndex) {
+    const source = Array.isArray(rawLines) ? rawLines : [];
+    const target = Array.isArray(paragraphLines) ? paragraphLines : [];
+    if (!target.length) {
+      return -1;
+    }
+    for (let index = Math.max(0, Number(startIndex) || 0); index <= source.length - target.length; index += 1) {
+      if (target.every(function (line, offset) { return source[index + offset] === line; })) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  function isRollupCaptionRollback(candidateText, currentText, previousText, rawRollupText) {
+    const candidate = normalizeCaptionLines(candidateText);
+    const current = normalizeCaptionLines(currentText);
+    const previous = normalizeCaptionLines(previousText);
+    if (!candidate || !current || !previous || candidate !== previous || current === previous) {
+      return false;
+    }
+    const rawLines = getNormalizedCaptionLineList(rawRollupText);
+    const previousLines = getNormalizedCaptionLineList(previous);
+    const currentLines = getNormalizedCaptionLineList(current);
+    const previousIndex = findCaptionLineSequence(rawLines, previousLines, 0);
+    const currentIndex = findCaptionLineSequence(
+      rawLines,
+      currentLines,
+      previousIndex >= 0 ? previousIndex + previousLines.length : 0
+    );
+    return previousIndex >= 0 && currentIndex >= 0;
+  }
+
+  function deriveTrailingRollupSuccessor(rawRollupText, predecessorText) {
+    const rawLines = getNormalizedCaptionLineList(rawRollupText);
+    const predecessorLines = getNormalizedCaptionLineList(predecessorText);
+    const predecessorIndex = findCaptionLineSequence(rawLines, predecessorLines, 0);
+    if (predecessorIndex < 0) {
+      return [];
+    }
+    return rawLines.slice(predecessorIndex + predecessorLines.length);
+  }
+
+  function isExactCaptionLineSequence(candidateText, expectedLines) {
+    const candidateLines = getNormalizedCaptionLineList(candidateText);
+    const expected = Array.isArray(expectedLines) ? expectedLines : [];
+    return candidateLines.length === expected.length && candidateLines.every(function (line, index) {
+      return line === expected[index];
+    });
+  }
+
+  function isCaptionLineFragment(candidateText, completeText) {
+    const candidateLines = getNormalizedCaptionLineList(candidateText);
+    const completeLines = getNormalizedCaptionLineList(completeText);
+    return candidateLines.length > 0 && candidateLines.length < completeLines.length &&
+      findCaptionLineSequence(completeLines, candidateLines, 0) >= 0;
+  }
+
   function normalizeCaptionState(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return { available: false, enabled: false };
@@ -118,6 +221,55 @@
     }
 
     return Math.max(0, Math.min(safeDuration, numericValue));
+  }
+
+  function getTimelinePointerPosition(clientX, left, width, duration) {
+    const safeClientX = Number(clientX);
+    const safeLeft = Number(left);
+    const safeWidth = Number(width);
+    const safeDuration = normalizeDuration(duration);
+    if (!Number.isFinite(safeClientX) || !Number.isFinite(safeLeft) ||
+      !Number.isFinite(safeWidth) || safeWidth <= 0 || !safeDuration) {
+      return null;
+    }
+
+    const percent = Math.max(0, Math.min(1, (safeClientX - safeLeft) / safeWidth));
+    return {
+      percent: percent,
+      seconds: percent * safeDuration
+    };
+  }
+
+  function getPointerSeekInputPlan(pointerInteractionActive, pointerTarget, rangeTarget) {
+    const safePointerTarget = Number(pointerTarget);
+    const safeRangeTarget = Number(rangeTarget);
+    if (pointerInteractionActive === true && Number.isFinite(safePointerTarget)) {
+      return {
+        targetTime: safePointerTarget,
+        source: 'pointer-geometry'
+      };
+    }
+
+    return {
+      targetTime: Number.isFinite(safeRangeTarget) ? safeRangeTarget : 0,
+      source: 'range-value'
+    };
+  }
+
+  function shouldCommitSeekInteraction(interactionId, committedInteractionId) {
+    const interaction = Number(interactionId);
+    return Number.isInteger(interaction) && interaction > 0 &&
+      interaction !== Number(committedInteractionId);
+  }
+
+  function isPlayerSynchronizedWithVideo(playerCurrentTime, videoCurrentTime, tolerance) {
+    return isSeekWithinTolerance(
+      playerCurrentTime,
+      videoCurrentTime,
+      Number.isFinite(Number(tolerance)) && Number(tolerance) >= 0
+        ? Number(tolerance)
+        : 1.5
+    );
   }
 
   function getSeekDisplayTime(actualTime, pendingTime, seekDragging, seekPending, duration) {
@@ -185,7 +337,8 @@
     playerCurrentTime,
     videoCurrentTime,
     requestedTime,
-    tolerance
+    tolerance,
+    progress
   ) {
     const playerConfirmed = isSeekWithinTolerance(
       playerCurrentTime,
@@ -199,14 +352,96 @@
     );
     const videoAvailable = videoCurrentTime !== null &&
       videoCurrentTime !== undefined;
+    const visibleVideoReachedTarget = Boolean(
+      progress && progress.visibleVideoReachedTarget === true
+    ) || videoConfirmed;
+    const preSeekVideoTime = progress && Number.isFinite(Number(progress.preSeekVideoTime))
+      ? Number(progress.preSeekVideoTime)
+      : null;
+    const actualVideoTime = Number(videoCurrentTime);
+    const targetTime = Number(requestedTime);
+    const safeTolerance = Number.isFinite(Number(tolerance)) && Number(tolerance) >= 0
+      ? Number(tolerance)
+      : 0.75;
+    const seekingForward = Number.isFinite(preSeekVideoTime) && Number.isFinite(targetTime) &&
+      targetTime > preSeekVideoTime + safeTolerance;
+    const seekingBackward = Number.isFinite(preSeekVideoTime) && Number.isFinite(targetTime) &&
+      targetTime < preSeekVideoTime - safeTolerance;
+    const snapback = Boolean(
+      visibleVideoReachedTarget && videoAvailable && Number.isFinite(actualVideoTime) && (
+        (seekingForward && actualVideoTime <= preSeekVideoTime + safeTolerance) ||
+        (seekingBackward && actualVideoTime >= preSeekVideoTime - safeTolerance)
+      )
+    );
     return {
       playerConfirmed: playerConfirmed,
       videoConfirmed: videoConfirmed,
-      confirmed: playerControlled === true
-        ? playerConfirmed && (!videoAvailable || videoConfirmed)
-        : videoAvailable
-          ? videoConfirmed
-          : playerConfirmed
+      visibleVideoReachedTarget: visibleVideoReachedTarget,
+      snapback: snapback,
+      confirmed: videoAvailable
+        ? visibleVideoReachedTarget && !snapback
+        : playerControlled === true && playerConfirmed
+    };
+  }
+
+  function intersectCaptionRects(first, second) {
+    if (!first || !second) {
+      return null;
+    }
+
+    const left = Math.max(Number(first.left), Number(second.left));
+    const right = Math.min(Number(first.right), Number(second.right));
+    const top = Math.max(Number(first.top), Number(second.top));
+    const bottom = Math.min(Number(first.bottom), Number(second.bottom));
+    if (![left, right, top, bottom].every(Number.isFinite) ||
+      right <= left || bottom <= top) {
+      return null;
+    }
+
+    return {
+      left: left,
+      right: right,
+      top: top,
+      bottom: bottom,
+      width: right - left,
+      height: bottom - top
+    };
+  }
+
+  function getCaptionSegmentMirrorPlan(segmentRect, effectiveClipRect, minVisibleHeightRatio) {
+    const rect = segmentRect && typeof segmentRect === 'object' ? segmentRect : null;
+    const clip = effectiveClipRect && typeof effectiveClipRect === 'object'
+      ? effectiveClipRect
+      : null;
+    const ratioThreshold = Number.isFinite(Number(minVisibleHeightRatio)) &&
+      Number(minVisibleHeightRatio) > 0 && Number(minVisibleHeightRatio) <= 1
+      ? Number(minVisibleHeightRatio)
+      : 0.5;
+    if (!rect || !clip || !Number.isFinite(Number(rect.height)) ||
+      Number(rect.height) <= 0) {
+      return {
+        shouldMirror: false,
+        visibleHeightRatio: 0,
+        verticalCenterInsideClip: false,
+        visibleRect: null
+      };
+    }
+
+    const visibleRect = intersectCaptionRects(rect, clip);
+    const visibleHeightRatio = visibleRect
+      ? visibleRect.height / Number(rect.height)
+      : 0;
+    const verticalCenter = (Number(rect.top) + Number(rect.bottom)) / 2;
+    const verticalCenterInsideClip = Number.isFinite(verticalCenter) &&
+      verticalCenter >= Number(clip.top) && verticalCenter <= Number(clip.bottom);
+    return {
+      shouldMirror: Boolean(
+        visibleRect && verticalCenterInsideClip &&
+        visibleHeightRatio >= ratioThreshold
+      ),
+      visibleHeightRatio: visibleHeightRatio,
+      verticalCenterInsideClip: verticalCenterInsideClip,
+      visibleRect: visibleRect
     };
   }
 
@@ -827,17 +1062,32 @@
     normalizeLanguage: normalizeLanguage,
     normalizeDuration: normalizeDuration,
     normalizeCaptionLines: normalizeCaptionLines,
+    getNormalizedCaptionLineList: getNormalizedCaptionLineList,
+    isStrictCaptionLineSuperset: isStrictCaptionLineSuperset,
+    getRollupCaptionTransitionPlan: getRollupCaptionTransitionPlan,
+    isCaptionTransitionCurrent: isCaptionTransitionCurrent,
+    getIncomingOnlyCaptionRenderPlan: getIncomingOnlyCaptionRenderPlan,
+    isRollupCaptionRollback: isRollupCaptionRollback,
+    deriveTrailingRollupSuccessor: deriveTrailingRollupSuccessor,
+    isExactCaptionLineSequence: isExactCaptionLineSequence,
+    isCaptionLineFragment: isCaptionLineFragment,
     normalizeCaptionState: normalizeCaptionState,
     resolveCaptionEnabledState: resolveCaptionEnabledState,
     getCaptionTogglePlan: getCaptionTogglePlan,
     isCaptionButtonPressed: isCaptionButtonPressed,
     clampSeekTime: clampSeekTime,
+    getTimelinePointerPosition: getTimelinePointerPosition,
+    getPointerSeekInputPlan: getPointerSeekInputPlan,
+    shouldCommitSeekInteraction: shouldCommitSeekInteraction,
+    isPlayerSynchronizedWithVideo: isPlayerSynchronizedWithVideo,
     getSeekDisplayTime: getSeekDisplayTime,
     isSeekWithinTolerance: isSeekWithinTolerance,
     isSeekNoOp: isSeekNoOp,
     getSeekCommitPlan: getSeekCommitPlan,
     isTimeBuffered: isTimeBuffered,
     getSeekConfirmationPlan: getSeekConfirmationPlan,
+    intersectCaptionRects: intersectCaptionRects,
+    getCaptionSegmentMirrorPlan: getCaptionSegmentMirrorPlan,
     getSeekExecutionPlan: getSeekExecutionPlan,
     getCaptionMutationOwnershipPlan: getCaptionMutationOwnershipPlan,
     selectCaptionWindowGeneration: selectCaptionWindowGeneration,

@@ -142,7 +142,9 @@ test('keeps seek UI pending until one authoritative commit is confirmed', () => 
     {
       playerConfirmed: false,
       videoConfirmed: true,
-      confirmed: false
+      visibleVideoReachedTarget: true,
+      snapback: false,
+      confirmed: true
     }
   );
   assert.deepEqual(
@@ -150,6 +152,8 @@ test('keeps seek UI pending until one authoritative commit is confirmed', () => 
     {
       playerConfirmed: true,
       videoConfirmed: true,
+      visibleVideoReachedTarget: true,
+      snapback: false,
       confirmed: true
     }
   );
@@ -194,6 +198,129 @@ test('keeps seek UI pending until one authoritative commit is confirmed', () => 
   assert.equal(utils.getSeekController(true), 'player');
   assert.equal(utils.getSeekController(false), 'video');
   assert.equal(utils.isSeekWithinTolerance(130, 130, 0.75), true);
+});
+
+test('uses full timeline geometry for mouse seeks without changing keyboard range input', () => {
+  const pointer = utils.getTimelinePointerPosition(68, 51.234375, 1205.53125, 1378);
+  assert.ok(Math.abs(pointer.seconds - 19.164191098) < 0.001);
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    utils.getPointerSeekInputPlan(true, pointer.seconds, 12.4)
+  )), {
+    targetTime: pointer.seconds,
+    source: 'pointer-geometry'
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    utils.getPointerSeekInputPlan(false, pointer.seconds, 12.4)
+  )), {
+    targetTime: 12.4,
+    source: 'range-value'
+  });
+  assert.equal(utils.shouldCommitSeekInteraction(7, 0), true);
+  assert.equal(utils.shouldCommitSeekInteraction(7, 7), false);
+});
+
+test('rejects stale players and distinguishes normal progression from snapback', () => {
+  assert.equal(utils.isPlayerSynchronizedWithVideo(52.8, 29.66, 1.5), false);
+  assert.equal(utils.isPlayerSynchronizedWithVideo(12.4, 12.8, 1.5), true);
+
+  const progressed = utils.getSeekConfirmationPlan(
+    true, 12.4, 13.2, 12.4, 0.5,
+    { visibleVideoReachedTarget: true, preSeekVideoTime: 10 }
+  );
+  assert.equal(progressed.confirmed, true);
+  assert.equal(progressed.snapback, false);
+
+  const snapped = utils.getSeekConfirmationPlan(
+    true, 12.4, 10.2, 12.4, 0.5,
+    { visibleVideoReachedTarget: true, preSeekVideoTime: 10 }
+  );
+  assert.equal(snapped.confirmed, false);
+  assert.equal(snapped.snapback, true);
+});
+
+test('mirrors only roll-up caption segments geometrically presented in the clip', () => {
+  const clip = { left: 0, right: 300, top: 100, bottom: 140, width: 300, height: 40 };
+  const currentTop = { left: 0, right: 300, top: 100, bottom: 120, width: 300, height: 20 };
+  const currentBottom = { left: 0, right: 300, top: 120, bottom: 140, width: 300, height: 20 };
+  const stale = { left: 0, right: 300, top: 60, bottom: 80, width: 300, height: 20 };
+  const barelyLeaving = { left: 0, right: 300, top: 85, bottom: 105, width: 300, height: 20 };
+
+  assert.equal(utils.getCaptionSegmentMirrorPlan(currentTop, clip, 0.5).shouldMirror, true);
+  assert.equal(utils.getCaptionSegmentMirrorPlan(currentBottom, clip, 0.5).shouldMirror, true);
+  assert.equal(utils.getCaptionSegmentMirrorPlan(stale, clip, 0.5).shouldMirror, false);
+  assert.equal(utils.getCaptionSegmentMirrorPlan(barelyLeaving, clip, 0.5).shouldMirror, false);
+});
+
+test('resolves complete roll-up paragraphs into extension-owned transitions', () => {
+  const fourLineParagraph = utils.normalizeCaptionLines(['L1', 'L2', 'L3', 'L4']);
+  assert.equal(fourLineParagraph, 'L1\nL2\nL3\nL4');
+  assert.equal(utils.getNormalizedCaptionLineList(fourLineParagraph).length, 4);
+  assert.equal(utils.normalizeCaptionLines(['L1', 'L2']), 'L1\nL2');
+
+  const superset = utils.getRollupCaptionTransitionPlan(
+    'A1\nA2', 'A1\nA2\nB1\nB2', true, true
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(superset)), {
+    shouldTransition: true,
+    transientSuperset: true,
+    currentText: 'A1\nA2',
+    incomingText: 'B1\nB2'
+  });
+  const direct = utils.getRollupCaptionTransitionPlan('A1\nA2', 'B1\nB2', true, false);
+  assert.equal(direct.incomingText, 'B1\nB2');
+  assert.equal(direct.transientSuperset, false);
+  const duplicate = utils.getRollupCaptionTransitionPlan('B1\nB2', 'B1\nB2', true, false);
+  assert.equal(duplicate.shouldTransition, false);
+  const nonRollup = utils.getRollupCaptionTransitionPlan('A1', 'A1\nB1', false, true);
+  assert.equal(nonRollup.transientSuperset, false);
+  const empty = utils.getRollupCaptionTransitionPlan('B1\nB2', '', true, false);
+  assert.equal(empty.shouldTransition, false);
+  assert.equal(utils.isCaptionTransitionCurrent(3, 3), true);
+  assert.equal(utils.isCaptionTransitionCurrent(3, 4), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    utils.getIncomingOnlyCaptionRenderPlan('B1\nB2\nB3\nB4')
+  )), {
+    visibleText: 'B1\nB2\nB3\nB4',
+    outgoingVisible: false,
+    animationPhase: 'incoming-only-entry'
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    utils.getIncomingOnlyCaptionRenderPlan('')
+  )), {
+    visibleText: '',
+    outgoingVisible: false,
+    animationPhase: 'idle'
+  });
+  assert.equal(
+    utils.isRollupCaptionRollback('A1\nA2', 'B1\nB2', 'A1\nA2', 'A1\nA2\nB1\nB2'),
+    true
+  );
+  assert.equal(
+    utils.isRollupCaptionRollback('B1\nB2', 'B1\nB2', 'A1\nA2', 'A1\nA2\nB1\nB2'),
+    false
+  );
+  assert.equal(
+    utils.isRollupCaptionRollback('B1\nB2', 'C1\nC2', 'B1\nB2', 'B1\nB2\nC1\nC2'),
+    true
+  );
+  assert.equal(
+    utils.isRollupCaptionRollback('A1\nA2', 'B1\nB2', '', 'A1\nA2\nB1\nB2'),
+    false
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    utils.deriveTrailingRollupSuccessor('A1\nA2\nB1\nB2', 'A1\nA2')
+  )), ['B1', 'B2']);
+  assert.equal(utils.isExactCaptionLineSequence('B1\nB2', ['B1', 'B2']), true);
+  assert.equal(utils.isExactCaptionLineSequence('B2', ['B1', 'B2']), false);
+  assert.equal(utils.isCaptionLineFragment('A2', 'A1\nA2'), true);
+  assert.equal(utils.isCaptionLineFragment('B2', 'B1\nB2'), true);
+  assert.equal(utils.isExactCaptionLineSequence('B1', ['B1']), true);
+});
+
+test('keeps an incoming caption visible before its roll animation frame', () => {
+  assert.match(stylesSource, /caption-viewport--incoming-ready/);
+  assert.match(stylesSource, /incoming-ready[\s\S]*caption-layer--incoming/);
+  assert.match(stylesSource, /translateY\(10px\)/);
 });
 
 test('selects caption windows by mutation generation without losing multiline cues', () => {

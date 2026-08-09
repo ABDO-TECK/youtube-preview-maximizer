@@ -143,6 +143,57 @@ html[dark] .ytpm-maximize-button {
   display: none !important;
 }
 
+.ytpm-overlay__caption-viewport {
+  position: relative !important;
+  overflow: hidden !important;
+}
+
+.ytpm-overlay__caption-layer {
+  white-space: pre-line !important;
+}
+
+.ytpm-overlay__caption-layer--incoming {
+  display: none !important;
+}
+
+.ytpm-overlay__caption-viewport.ytpm-overlay__caption-viewport--rolling {
+  min-height: var(--ytpm-caption-transition-height, 1.35em) !important;
+}
+
+.ytpm-overlay__caption-viewport.ytpm-overlay__caption-viewport--incoming-ready {
+  min-height: var(--ytpm-caption-transition-height, 1.35em) !important;
+}
+
+.ytpm-overlay__caption-viewport--incoming-ready .ytpm-overlay__caption-layer--current {
+  display: none !important;
+}
+
+.ytpm-overlay__caption-viewport--incoming-ready .ytpm-overlay__caption-layer--incoming {
+  display: block !important;
+  transform: translateY(10px) !important;
+  opacity: .9 !important;
+}
+
+.ytpm-overlay__caption-viewport--rolling .ytpm-overlay__caption-layer {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+}
+
+.ytpm-overlay__caption-viewport--rolling .ytpm-overlay__caption-layer--current {
+  display: none !important;
+}
+
+.ytpm-overlay__caption-viewport--rolling .ytpm-overlay__caption-layer--incoming {
+  display: block !important;
+  animation: ytpm-caption-roll-in 140ms cubic-bezier(.2, .75, .3, 1) forwards !important;
+}
+
+@keyframes ytpm-caption-roll-in {
+  from { transform: translateY(10px); opacity: .9; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
 .ytpm-overlay__frame:fullscreen {
   width: 100vw !important;
   height: 100vh !important;

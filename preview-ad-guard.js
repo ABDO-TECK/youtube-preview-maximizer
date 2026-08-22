@@ -837,6 +837,7 @@
       if (handoff.recoveryInvoked) return 'ALREADY_INVOKED';
       const activeMedia = media();
       if (!activeMedia || activeMedia !== state.media || !isConnected(activeMedia)) return 'MEDIA_DISCONNECTED';
+      if (handoff.media !== activeMedia || handoff.video !== activeMedia) return 'MEDIA_CHANGED';
       const playerEl = player();
       if (!playerEl || !isConnected(playerEl)) return 'PLAYER_DISCONNECTED';
       const identity = ownershipIdentity(activeMedia);
@@ -867,34 +868,85 @@
         return;
       }
       handoff.recoveryInvoked = true;
-      const recovery = { handoffSerial: handoff.serial, loadEpoch: handoff.epoch, videoId: config.videoId, issuedAt: latencyNow(), resultTimer: 0, transitionSeen: false, outcomeLogged: false };
+      const activeMedia = media();
+      const identity = ownershipIdentity(activeMedia);
+      const recovery = {
+        handoffSerial: handoff.serial,
+        loadEpoch: handoff.epoch,
+        media: activeMedia,
+        video: activeMedia,
+        outer: identity.outer,
+        inner: identity.inner,
+        videoId: config.videoId,
+        issuedAt: latencyNow(),
+        resultTimer: 0,
+        transitionSeen: false,
+        outcomeLogged: false
+      };
       state.contentReadyRecovery = recovery;
       contentReadyRecoveryLog('invoked', { handoffSerial: handoff.serial, loadEpoch: handoff.epoch, videoId: config.videoId, elapsedMs: Math.max(0, Math.round(latencyNow() - (handoff.recoveryStartedAt || latencyNow()))) });
       const bridgePromise = typeof config.contentReadyRecovery === 'function'
         ? config.contentReadyRecovery()
         : config.holdBreakProbe();
       Promise.resolve(bridgePromise).then(function (result) {
+        if (!current() || state.contentReadyRecovery !== recovery) {
+          contentReadyRecoveryLog('invalidated', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch, reason: 'ASYNC_STALE_SESSION' });
+          return;
+        }
+        if (state.loadEpoch !== recovery.loadEpoch) {
+          contentReadyRecoveryLog('invalidated', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch, reason: 'ASYNC_EPOCH_CHANGED' });
+          return;
+        }
+        const currentActiveMedia = media();
+        if (!currentActiveMedia || currentActiveMedia !== state.media || currentActiveMedia !== recovery.media || currentActiveMedia !== recovery.video || !isConnected(currentActiveMedia)) {
+          contentReadyRecoveryLog('invalidated', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch, reason: 'ASYNC_MEDIA_CHANGED' });
+          return;
+        }
+        const currentIdentity = ownershipIdentity(currentActiveMedia);
+        if (currentIdentity.outer !== recovery.outer || currentIdentity.inner !== recovery.inner || currentIdentity.video !== recovery.video) {
+          contentReadyRecoveryLog('invalidated', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch, reason: 'ASYNC_OWNERSHIP_CHANGED' });
+          return;
+        }
+        if (!state.pageContentConfirmed || !state.lastAssociation || !state.lastAssociation.matches) {
+          contentReadyRecoveryLog('invalidated', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch, reason: 'ASYNC_CONTENT_IDENTITY_LOST' });
+          return;
+        }
+        const recoveryCtx = typeof config.getRecoveryContext === 'function' ? config.getRecoveryContext() || {} : {};
+        if (recoveryCtx.ownershipValid === false || recoveryCtx.hoverValid === false) {
+          contentReadyRecoveryLog('invalidated', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch, reason: 'ASYNC_RECOVERY_CONTEXT_LOST' });
+          return;
+        }
         const loadInvoked = Boolean(result && result.loadInvoked);
         const loadThrew = Boolean(result && result.loadThrew);
         if (!loadInvoked || loadThrew) {
-          contentReadyRecoveryLog('invalidated', { handoffSerial: handoff.serial, loadEpoch: handoff.epoch, reason: 'COMMAND_REJECTED', loadInvoked: loadInvoked, loadThrew: loadThrew });
+          contentReadyRecoveryLog('invalidated', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch, reason: 'COMMAND_REJECTED', loadInvoked: loadInvoked, loadThrew: loadThrew });
           return;
         }
         recovery.resultTimer = window.setTimeout(function () {
           recovery.resultTimer = 0;
+          if (!current() || state.loadEpoch !== recovery.loadEpoch || state.contentReadyRecovery !== recovery) {
+            return;
+          }
+          const timerMedia = media();
+          if (!timerMedia || timerMedia !== state.media || timerMedia !== recovery.media || timerMedia !== recovery.video) {
+            return;
+          }
+          if (!state.pageContentConfirmed || !state.lastAssociation || !state.lastAssociation.matches) {
+            return;
+          }
           if (!recovery.outcomeLogged && !recovery.transitionSeen && state.contentReadyRecovery === recovery) {
             recovery.outcomeLogged = true;
-            contentReadyRecoveryLog('no-effect', { handoffSerial: handoff.serial, loadEpoch: handoff.epoch });
+            contentReadyRecoveryLog('no-effect', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch });
           }
         }, CONTENT_READY_RECOVERY_RESULT_MS);
       }).catch(function () {
-        contentReadyRecoveryLog('invalidated', { handoffSerial: handoff.serial, loadEpoch: handoff.epoch, reason: 'COMMAND_ERROR' });
+        contentReadyRecoveryLog('invalidated', { handoffSerial: recovery.handoffSerial, loadEpoch: recovery.loadEpoch, reason: 'COMMAND_ERROR' });
       });
     }
     function deferHandoffForMediaReady(handoff, activeMedia) {
       if (!handoff || handoff.stage === 'waiting-media-ready') return;
       const identity = ownershipIdentity(activeMedia);
-      handoff.outer = identity.outer; handoff.inner = identity.inner; handoff.video = identity.video;
+      handoff.outer = identity.outer; handoff.inner = identity.inner; handoff.video = identity.video; handoff.media = activeMedia;
       handoff.stage = 'waiting-media-ready'; handoff.readinessCleanup = handoff.readinessCleanup || [];
       contentHandoffLog(handoff.epoch, 'waiting-media-ready', Object.assign({ reason: 'MEDIA_NOT_READY', handoffSerial: handoff.serial }, deferredHandoffFields(handoff, activeMedia)));
       if (state.confirmedAdSegments > 0 && Number(activeMedia.readyState) === 0 && !handoff.recoveryArmed && !handoff.recoveryInvoked) {

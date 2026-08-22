@@ -36,8 +36,9 @@
   const PREVIEW_AD_VIDEO_ATTRIBUTE = 'data-ytpm-preview-ad-video-id';
   const PREVIEW_AD_SESSION_PATTERN = /^[a-f0-9]{32}$/;
   const PLAYER_VIDEO_SYNC_TOLERANCE = 1.5;
-  // Temporary runtime-forensics switch. This mirrors the content-script gate.
-  const DEBUG_LOGGING = true;
+  // Production-safe debug gate. Mirrors content script gate.
+  const DEBUG_LOGGING = typeof window !== 'undefined' && Boolean(window.location) &&
+    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || !window.location.hostname);
   const captionTrackMemory = new WeakMap();
 
   const currentScript = document.currentScript;
@@ -143,10 +144,22 @@
     return { requestedVideoId: videoId, cardPresent: Boolean(card), previewPresent: Boolean(preview), previewActive: Boolean(preview && preview.hasAttribute('active')), naturallyHovered: Boolean(card && (card.matches(':hover') || card.querySelector(':hover'))), trueInnerPlayerPresent: Boolean(inner), trueInnerPlayerConnected: Boolean(inner && inner.isConnected), trueInnerPlayerVisible: Boolean(inner && isVisibleNode(inner)) };
   }
 
+  function isSupportedFallbackPath(pathname) {
+    const path = typeof pathname === 'string'
+      ? pathname
+      : (typeof window !== 'undefined' && window.location ? window.location.pathname : '');
+    return path.startsWith('/feed/history') ||
+      path.startsWith('/@') ||
+      path.startsWith('/channel/') ||
+      path.startsWith('/c/') ||
+      path.startsWith('/user/') ||
+      path.startsWith('/watch');
+  }
+
   function prepareHistoryFallbackPlayer(videoId) {
     const requestedVideoId = normalizeVideoId(videoId);
-    if (window.location.pathname !== '/feed/history' || !requestedVideoId) {
-      return { ok: false, reason: window.location.pathname !== '/feed/history' ? 'history-only' : 'invalid-video-id' };
+    if (!isSupportedFallbackPath(window.location.pathname) || !requestedVideoId) {
+      return { ok: false, reason: !isSupportedFallbackPath(window.location.pathname) ? 'wrong-pathname' : 'invalid-video-id' };
     }
     const card = getHistoryFallbackCard(requestedVideoId);
     const preview = document.querySelector(PREVIEW_SELECTOR);
@@ -165,10 +178,30 @@
       return { ok: false, reason: 'prepare-player-threw' };
     }
   }
+  function isMembersOnlyRestrictedResponse(response) {
+    if (!response || typeof response !== 'object') {
+      return false;
+    }
+    const status = response.playabilityStatus;
+    if (!status || typeof status !== 'object') {
+      return false;
+    }
+    if (status.status === 'UNPLAYABLE') {
+      if (status.errorScreen && typeof status.errorScreen.ypShowOfferRenderer === 'object') {
+        return true;
+      }
+      const reason = String(status.reason || status.messages || '').toLowerCase();
+      if (reason.includes('member') || reason.includes('join this channel')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function loadHistoryFallbackVideo(videoId, generation) {
     const requestedVideoId = normalizeVideoId(videoId);
-    if (window.location.pathname !== '/feed/history' || !requestedVideoId) {
-      return { ok: false, reason: window.location.pathname !== '/feed/history' ? 'wrong-pathname' : 'invalid-video-id', generation: generation, outerPresent: false, innerPresent: false, loadMethodPresent: false, loadInvoked: false, videoPresentBefore: false, videoPresentAfterImmediate: false, pausedAfterImmediate: null, readyStateAfterImmediate: null };
+    if (!isSupportedFallbackPath(window.location.pathname) || !requestedVideoId) {
+      return { ok: false, reason: !isSupportedFallbackPath(window.location.pathname) ? 'wrong-pathname' : 'invalid-video-id', generation: generation, outerPresent: false, innerPresent: false, loadMethodPresent: false, loadInvoked: false, videoPresentBefore: false, videoPresentAfterImmediate: false, pausedAfterImmediate: null, readyStateAfterImmediate: null };
     }
     const card = getHistoryFallbackCard(requestedVideoId);
     const preview = document.querySelector(PREVIEW_SELECTOR);
@@ -185,6 +218,13 @@
     const baseResult = { ok: false, reason: '', generation: generation, outerPresent: true, innerPresent: true, loadMethodPresent: true, loadInvoked: false, videoPresentBefore: Boolean(videoBefore), videoPresentAfterImmediate: false, pausedAfterImmediate: null, readyStateAfterImmediate: null };
     try {
       inner.loadVideoById(requestedVideoId);
+      const response = getPlayerResponse(inner);
+      if (isMembersOnlyRestrictedResponse(response)) {
+        baseResult.ok = false;
+        baseResult.reason = 'members-only-restricted';
+        baseResult.loadInvoked = true;
+        return baseResult;
+      }
       const videoAfter = inner.querySelector('video');
       baseResult.ok = true;
       baseResult.reason = null;
@@ -203,7 +243,7 @@
   function loadOwnedHistoryHoldBreakVideo(videoId, sessionId) {
     const context = getOwnedPreviewAdContext(videoId, sessionId);
     const player = context && context.player;
-    if (window.location.pathname !== '/feed/history' || !context || !context.playerElement || !context.playerElement.isConnected || !player || typeof player.loadVideoById !== 'function') {
+    if (!isSupportedFallbackPath(window.location.pathname) || !context || !context.playerElement || !context.playerElement.isConnected || !player || typeof player.loadVideoById !== 'function') {
       return { ok: false, loadInvoked: false, loadThrew: false };
     }
     try { player.loadVideoById(normalizeVideoId(videoId)); return { ok: true, loadInvoked: true, loadThrew: false }; }

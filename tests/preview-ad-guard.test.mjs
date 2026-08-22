@@ -3290,6 +3290,84 @@ test('Hover loss before 5000ms timer invalidates recovery with zero commands and
   guard.disarm();
 });
 
+test('ContentReadyRecovery race: media element change before callback invalidates recovery with zero commands', async () => {
+  const { api, logs, runNextTimer } = loadGuard();
+  const player = new FakeElement();
+  const overlay = new FakeElement();
+  let currentMedia = createActiveMedia();
+  currentMedia.readyState = 3;
+  currentMedia.duration = 10;
+  currentMedia.seekable = { length: 1, end: () => 10 };
+  let bridgeStatus = { requestedVideoIdMatches: false, active: true, reason: 'ad-showing', associationSource: 'player-api', associationAvailable: true, playerVideoIdMatchesRequested: true };
+  let recoveryCommandInvoked = 0;
+
+  const guard = api.create({
+    generation: 218,
+    sessionId: 'gen-218',
+    surface: 'history-native-fallback',
+    videoId: 'dQw4w9WgXcQ',
+    getPlayer: () => player,
+    getMedia: () => currentMedia,
+    media: currentMedia,
+    overlay: overlay,
+    isCurrent: () => true,
+    status: () => Promise.resolve(bridgeStatus),
+    contentReadyRecovery: () => {
+      recoveryCommandInvoked += 1;
+      return Promise.resolve({ ok: true, loadInvoked: true, loadThrew: false });
+    },
+    getRecoveryContext: () => ({ ownershipValid: true, hoverValid: true })
+  });
+
+  guard.arm();
+  guard.noteLoadRequested();
+
+  // 1. Initial confirmed ad segment
+  currentMedia.emit('loadstart');
+  player.classList.add('ad-showing');
+  guard.refresh();
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  runUntil(runNextTimer, () => guard.status().confirmedAdSegments === 1);
+  assert.equal(guard.status().confirmedAdSegments, 1);
+
+  // 2. Transition to requested content (readyState=0) -> arms recovery timer (5000ms)
+  player.classList.remove('ad-showing');
+  bridgeStatus.active = false;
+  bridgeStatus.reason = 'content';
+  bridgeStatus.requestedVideoIdMatches = true;
+  currentMedia.readyState = 0;
+  currentMedia.duration = NaN;
+  currentMedia.seekable = { length: 0 };
+  currentMedia.emit('loadstart');
+  guard.refresh();
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+  runNextTimer(); // 100ms post-load classification
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+  const armedLog = logs.find((entry) => entry[0] === '[YTPM][ContentReadyRecovery]' && entry.join(' ').includes('phase=armed'));
+  assert.ok(armedLog, 'ContentReadyRecovery must be armed');
+
+  // 3. Media element changes / replaced before recovery timer fires
+  const newMedia = createActiveMedia();
+  newMedia.readyState = 0;
+  currentMedia = newMedia;
+  guard.refresh();
+
+  // 4. Old recovery callback / timer fires
+  runUntil(runNextTimer, () => logs.some((entry) => entry[0] === '[YTPM][ContentReadyRecovery]' && entry.join(' ').includes('phase=invalidated')), 80);
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+  // 5. Assert: Callback was safely ignored, zero commands executed, gate stays closed
+  assert.equal(recoveryCommandInvoked, 0, 'Zero recovery commands should run on stale/replaced media');
+  assert.equal(guard.status().presentationClosed, true, 'Presentation gate must remain closed');
+
+  const invalidatedLog = logs.find((entry) => entry[0] === '[YTPM][ContentReadyRecovery]' && entry.join(' ').includes('reason=MEDIA_CHANGED'));
+  assert.ok(invalidatedLog, 'ContentReadyRecovery log must record invalidated due to MEDIA_CHANGED');
+
+  guard.disarm();
+});
+
 test('RapidReentryBarrier 1: Fresh normal History load has no regression', async () => {
   const { api, logs, runNextTimer } = loadGuard();
   const player = new FakeElement();

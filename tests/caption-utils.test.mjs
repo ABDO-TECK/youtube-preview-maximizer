@@ -801,3 +801,49 @@ test('extracts only the marked JSON object from a player response', () => {
   assert.deepEqual(JSON.parse(JSON.stringify(result)), { captions: { ok: true } });
   assert.equal(utils.extractJsonObject('var other = {};', 'ytInitialPlayerResponse'), null);
 });
+
+test('normal caption file parses accurately with multiline formatting and valid ranges', () => {
+  const events = [
+    { tStartMs: 1000, dDurationMs: 2500, segs: [{ utf8: 'First line\nSecond line' }] },
+    { tStartMs: 4000, dDurationMs: 1800, segs: [{ utf8: 'Next subtitle segment' }] }
+  ];
+  const cues = utils.parseJsonCaptionCues(JSON.stringify({ events }));
+  assert.equal(cues.length, 2);
+  assert.equal(cues[0].start, 1);
+  assert.equal(cues[0].duration, 2.5);
+  assert.equal(cues[0].text, 'First line\nSecond line');
+  assert.equal(cues[1].start, 4);
+  assert.equal(cues[1].duration, 1.8);
+  assert.equal(cues[1].text, 'Next subtitle segment');
+});
+
+test('huge caption response of 10000 cues is safely capped at MAX_CAPTION_CUES (5000) without memory explosion', () => {
+  const events = Array.from({ length: 10000 }, (_, index) => ({
+    tStartMs: index * 1000,
+    dDurationMs: 800,
+    segs: [{ utf8: `Subtitle cue #${index}` }]
+  }));
+  const cues = utils.parseJsonCaptionCues(JSON.stringify({ events }));
+  assert.equal(cues.length, 5000);
+  assert.equal(cues[0].text, 'Subtitle cue #0');
+  assert.equal(cues[4999].text, 'Subtitle cue #4999');
+});
+
+test('invalid cues do not consume the MAX_CAPTION_CUES budget', () => {
+  // 1000 invalid events followed by 6000 valid events -> exactly 5000 valid cues must be extracted
+  const invalidEvents = Array.from({ length: 1000 }, (_, index) => ({
+    tStartMs: -500,
+    dDurationMs: 0,
+    segs: [{ utf8: '   ' }]
+  }));
+  const validEvents = Array.from({ length: 6000 }, (_, index) => ({
+    tStartMs: (index + 1) * 1000,
+    dDurationMs: 1000,
+    segs: [{ utf8: `Valid cue #${index}` }]
+  }));
+  const cues = utils.parseJsonCaptionCues(JSON.stringify({ events: invalidEvents.concat(validEvents) }));
+  assert.equal(cues.length, 5000);
+  assert.equal(cues[0].text, 'Valid cue #0');
+  assert.equal(cues[4999].text, 'Valid cue #4999');
+});
+

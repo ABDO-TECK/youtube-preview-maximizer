@@ -66,6 +66,15 @@
   const SYNTHETIC_CAPTION_ATTRIBUTE = 'data-ytpm-caption-track';
   const PREVIEW_MESSAGE = 'Move the mouse over the thumbnail until the preview starts, then try again.';
   const PREVIEW_OPEN_ERROR_MESSAGE = 'The active preview could not be opened. Please try again.';
+  const MEMBERS_ONLY_MESSAGE = 'This video is available to channel members only.';
+  const MEMBERS_ONLY_BADGE_SELECTOR = [
+    '.badge-style-type-members-only',
+    '.badge-shape-wiz--members-only',
+    '[badge-shape-wiz--members-only]',
+    'ytd-thumbnail-overlay-time-status-renderer[overlay-style="MEMBERS_ONLY"]',
+    '.yt-badge-shape-view-model--members-only',
+    'yt-icon[badge-shape-wiz--members-only]'
+  ].join(', ');
   const PREVIEW_LOOKUP_TIMEOUT_MS = 5000;
   const PREVIEW_RETRY_DELAY_MS = 80;
   const PLAYBACK_RETRY_DELAY_MS = 120;
@@ -92,9 +101,9 @@
   const SEEK_MAX_SECONDS = 86400;
   const CONTROLS_HIDE_DELAY_MS = 5000;
   const BRIDGE_ID_PATTERN = /^request-\d{1,12}$/;
-  // Temporary runtime-forensics switch. Keep all diagnostic behavior behind
-  // this gate so it can be removed without changing the production paths.
-  const DEBUG_LOGGING = true;
+  // Production-safe debug gate. Enabled for localhost/dev testing, disabled on production YouTube domains.
+  const DEBUG_LOGGING = typeof window !== 'undefined' && Boolean(window.location) &&
+    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || !window.location.hostname);
   const FORENSIC_LOG_LIMIT = 1500;
   const documentInitialPathname = window.location.pathname;
   const documentStartedAt = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
@@ -685,12 +694,99 @@
     return value && value.nodeType === 1;
   }
 
+  function isTextInputElement(target) {
+    if (!isElement(target)) {
+      return false;
+    }
+    if (target.isContentEditable || target.getAttribute('contenteditable') === 'true') {
+      return true;
+    }
+    if (typeof target.closest === 'function' && target.closest('[contenteditable="true"]')) {
+      return true;
+    }
+    const tag = target.tagName;
+    if (tag === 'TEXTAREA') {
+      return true;
+    }
+    if (tag === 'INPUT') {
+      const type = String(target.type || 'text').toLowerCase();
+      return type === 'text' || type === 'search' || type === 'password' ||
+        type === 'email' || type === 'number' || type === 'url' || type === 'tel';
+    }
+    return false;
+  }
+
   function isAdCard(card) {
     if (!isElement(card)) {
       return false;
     }
 
     return card.matches(AD_CARD_SELECTOR) || Boolean(card.querySelector(AD_CARD_SELECTOR));
+  }
+
+  function detectCurrentSurface(pathname) {
+    const path = typeof pathname === 'string'
+      ? pathname
+      : (typeof window !== 'undefined' && window.location ? window.location.pathname : '');
+
+    if (path === '/' || path === '') {
+      return 'HOME';
+    }
+    if (path.startsWith('/results')) {
+      return 'SEARCH';
+    }
+    if (path.startsWith('/feed/history')) {
+      return 'HISTORY';
+    }
+    if (path.startsWith('/watch')) {
+      return 'WATCH';
+    }
+    if (path.startsWith('/@') || path.startsWith('/channel/') || path.startsWith('/c/') || path.startsWith('/user/')) {
+      return 'CHANNEL';
+    }
+    return 'OTHER';
+  }
+
+  function isNativeFallbackSurface(pathname) {
+    const surface = detectCurrentSurface(pathname);
+    return surface === 'HISTORY' || surface === 'CHANNEL' || surface === 'WATCH';
+  }
+
+  function getSurfaceDiagnostics(trigger, details) {
+    const surface = detectCurrentSurface();
+    const cards = Array.from(collectCards(document));
+    const tagCounts = {};
+    const matchedSelectors = [];
+
+    const individualSelectors = CARD_SELECTOR.split(',').map(function (s) { return s.trim(); });
+    individualSelectors.forEach(function (sel) {
+      if (document.querySelector(sel)) {
+        matchedSelectors.push(sel);
+      }
+    });
+
+    cards.forEach(function (card) {
+      const tag = card.tagName ? card.tagName.toLowerCase() : 'unknown';
+      tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+    });
+
+    return Object.assign({
+      surface: surface,
+      pathname: typeof window !== 'undefined' && window.location ? window.location.pathname : '',
+      trigger: trigger || 'scan',
+      cardCount: cards.length,
+      cardTagNames: tagCounts,
+      matchedSelectors: matchedSelectors,
+      buttonCount: document.querySelectorAll('.' + BUTTON_CLASS).length
+    }, details || {});
+  }
+
+  function logSurfaceDiagnostics(trigger, details) {
+    if (!DEBUG_LOGGING || typeof console === 'undefined' || typeof console.debug !== 'function') {
+      return;
+    }
+
+    console.debug('[YTPM][SurfaceDiagnostics]', getSurfaceDiagnostics(trigger, details));
   }
 
   function reportAdCandidateRejected(card) {
@@ -763,15 +859,47 @@
     return resolveThumbnailHost(watchLink, card);
   }
 
-  function isHistoryThumbnailHovered(card) {
+  function isThumbnailHovered(card) {
     if (!card || !isElement(card)) {
       return false;
     }
     const thumbnailHost = findThumbnailHost(card);
     return Boolean(thumbnailHost && (
       thumbnailHost.matches(':hover') ||
-      thumbnailHost.querySelector(':hover')
+      (typeof thumbnailHost.querySelector === 'function' && thumbnailHost.querySelector(':hover'))
     ));
+  }
+
+  const isHistoryThumbnailHovered = isThumbnailHovered;
+
+  function isMembersOnlyCard(card) {
+    if (!card || !isElement(card)) {
+      return false;
+    }
+
+    if (card.querySelector(MEMBERS_ONLY_BADGE_SELECTOR)) {
+      return true;
+    }
+
+    const titleOrThumbnail = card.querySelector('a#thumbnail, a#video-title-link, a#video-title, #video-title, yt-formatted-string#video-title');
+    if (titleOrThumbnail) {
+      const ariaLabel = titleOrThumbnail.getAttribute('aria-label') || '';
+      const title = titleOrThumbnail.getAttribute('title') || titleOrThumbnail.textContent || '';
+      if (/\bmembers[\s-]only\b/i.test(ariaLabel) || /\bmembers[\s-]only\b/i.test(title)) {
+        return true;
+      }
+    }
+
+    const badges = card.querySelectorAll('ytd-badge-supported-renderer, .badge, [aria-label*="Members only" i], [title*="Members only" i], .yt-badge-shape-view-model');
+    for (let i = 0; i < badges.length; i += 1) {
+      const b = badges[i];
+      const text = (b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '');
+      if (/\bmembers[\s-]only\b/i.test(text)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function hasVideoSource(video) {
@@ -1206,17 +1334,26 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = BUTTON_CLASS;
-    button.setAttribute('aria-label', window.location.pathname === '/feed/history'
-      ? 'Open in YTPM'
-      : 'Maximize YouTube preview');
-    button.title = window.location.pathname === '/feed/history'
-      ? 'Open in YTPM'
-      : 'Maximize YouTube preview';
+    const isMembersOnly = isMembersOnlyCard(card);
+    button.setAttribute('aria-label', isMembersOnly
+      ? 'Members-only video'
+      : isNativeFallbackSurface(window.location.pathname)
+        ? 'Open in YTPM'
+        : 'Maximize YouTube preview');
+    button.title = isMembersOnly
+      ? 'Members-only video'
+      : isNativeFallbackSurface(window.location.pathname)
+        ? 'Open in YTPM'
+        : 'Maximize YouTube preview';
     button.textContent = '⛶';
 
     button.addEventListener('click', function (event) {
       event.preventDefault();
       event.stopPropagation();
+      if (isMembersOnlyCard(card)) {
+        showPreviewNotice(MEMBERS_ONLY_MESSAGE);
+        return;
+      }
       lastHoveredCard = card;
       const buttonState = previewButtonState && previewButtonState.card === card
         ? previewButtonState
@@ -1929,11 +2066,25 @@
       return;
     }
 
-    if (window.location.pathname === '/feed/history' && !isHistoryThumbnailHovered(card)) {
+    if (isMembersOnlyCard(card)) {
+      return;
+    }
+
+    if (isNativeFallbackSurface(window.location.pathname) && !isThumbnailHovered(card)) {
       return;
     }
 
     lastHoveredCard = card;
+    if (DEBUG_LOGGING) {
+      const preview = findActivePreview(card);
+      const video = findPreviewVideo(card, preview);
+      logSurfaceDiagnostics('hover', {
+        hoveredCardTag: card.tagName ? card.tagName.toLowerCase() : '',
+        buttonInjected: Boolean(findButtonOwnedByCard(card)),
+        previewDetected: Boolean(preview),
+        previewVideoDetected: Boolean(video && isPreviewReady(video))
+      });
+    }
     if (window.location.pathname === '/') { snapshotPreviewEligibilityState.generation = (snapshotPreviewEligibilityState.generation || 0) + 1; snapshotPreviewEligibilityState(card, 'home', snapshotPreviewEligibilityState.generation); }
     schedulePreviewSync();
     queueHistoryNativeFallback(card);
@@ -2312,18 +2463,28 @@
 
   function requestHistoryNativeFallbackInternal(videoId, trigger, capturedCard) {
     historyNativeFallbackPhase = 'validate';
-    if (window.location.pathname !== '/feed/history') { logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'wrong-pathname' }); return; }
+    if (!isNativeFallbackSurface(window.location.pathname)) { logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'wrong-pathname' }); return; }
     if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) { logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'invalid-video-id' }); return; }
     if (historyNativeFallbackSession) {
       logHistoryOwnershipEnd(historyNativeFallbackSession, 'replaced');
       cleanupHistoryNativeFallback('replaced');
     }
     const card = capturedCard || findHistoryFallbackCard(videoId);
+    if (isMembersOnlyCard(card)) {
+      logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'members-only-restricted', requestedVideoId: videoId });
+      return;
+    }
     const preview = document.querySelector('ytd-video-preview');
     const outer = document.querySelector('ytd-player#inline-player');
-    if (preview && preview.hasAttribute('active') && isPreviewAssociatedWithCard(card, preview)) { logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'natural-preview-already-active', requestedVideoId: videoId }); return; }
+    if (preview && preview.hasAttribute('active') && isPreviewAssociatedWithCard(card, preview)) {
+      const activeVideo = findVideoInPreview(preview);
+      if (activeVideo && isPreviewReady(activeVideo)) {
+        logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'natural-preview-already-active', requestedVideoId: videoId });
+        return;
+      }
+    }
     const hovered = Boolean(card && (card.matches(':hover') || card.querySelector(':hover')));
-    const thumbnailHovered = isHistoryThumbnailHovered(card);
+    const thumbnailHovered = isThumbnailHovered(card);
     if (!card || !isElement(card) || !thumbnailHovered || !preview || !outer) {
       logHistoryNativeFallback('historyNativeFallbackFailed', { phase: 'validate', reason: !card ? 'target-card-not-found' : !thumbnailHovered ? 'thumbnail-not-hovered' : !preview ? 'preview-not-found' : 'outer-player-not-found', requestedVideoId: videoId, cardHovered: hovered, thumbnailHovered: thumbnailHovered });
       return;
@@ -2355,7 +2516,7 @@
           if (typeof MutationObserver === 'function') {
             session.mediaObserver = new MutationObserver(function () {
               const media = session.outer.querySelector('#inline-preview-player video, #inline-preview-player.html5-video-player video');
-              if (media && historyNativeFallbackSession === session) {
+              if (media && historyNativeFallbackSession === session && (!activeOverlay || activeOverlay.video !== media)) {
                 media.muted = true;
               }
             });
@@ -2376,7 +2537,7 @@
               logHistoryNativeFallback('historyNativeFallbackLoadInvoked', { videoId: videoId, generation: session.generation });
               session.monitorTimer = window.setInterval(function () {
                 if (historyNativeFallbackSession !== session) { return; }
-                if (window.location.pathname !== '/feed/history' || !session.card.isConnected || lastHoveredCard !== session.card || !isHistoryFallbackInteractionValid(session)) {
+                if (!isNativeFallbackSurface(window.location.pathname) || !session.card.isConnected || lastHoveredCard !== session.card || !isHistoryFallbackInteractionValid(session)) {
                   logHistoryOwnershipEnd(session, 'fallback-ownership-ended', {
                     callbackGeneration: session.generation,
                     currentGeneration: historyNativeFallbackGeneration,
@@ -2387,7 +2548,7 @@
                 }
                 const state = historyNativeFallbackState(session);
                 const media = session.outer.querySelector('#inline-preview-player video');
-                if (media) {
+                if (media && (!activeOverlay || activeOverlay.video !== media)) {
                   media.muted = true;
                 }
                 if (!session.mediaStarted && state.sourceScheme !== 'empty' && state.paused === false) {
@@ -2551,7 +2712,7 @@
   }
 
   function queueHistoryNativeFallback(card) {
-    if (window.location.pathname !== '/feed/history') {
+    if (!isNativeFallbackSurface(window.location.pathname) || !card || !isElement(card) || isMembersOnlyCard(card)) {
       return;
     }
     if (historyNativeFallbackStartTimer) {
@@ -2559,15 +2720,19 @@
       logHistoryOwnershipEndCancel(historyNativeFallbackSession ? historyNativeFallbackSession.generation : 'none', historyNativeFallbackIntentGeneration, 'intent-rescheduled');
     }
     const videoId = getVideoIdFromKey(getCardVideoKey(card));
+    if (!videoId) {
+      return;
+    }
     const intentGeneration = ++historyNativeFallbackIntentGeneration;
-    snapshotPreviewEligibilityState(card, 'history', intentGeneration);
+    const surfaceName = detectCurrentSurface(window.location.pathname).toLowerCase();
+    snapshotPreviewEligibilityState(card, surfaceName, intentGeneration);
     startHistoryYtActionTargetMirror(card, getCardVideoKey(card), intentGeneration);
-    forensicLog('HistoryNativeFallback', 'historyNativeFallbackTargetScheduled', Object.assign({ requestedVideoId: videoId, scheduledCardPresent: Boolean(card), scheduledCardConnected: Boolean(card && card.isConnected), scheduledCardTagName: card ? card.tagName : '', scheduledCardClassName: card ? String(card.className || '').slice(0, 160) : '', scheduledCardHovered: Boolean(card && (card.matches(':hover') || card.querySelector(':hover'))), scheduledThumbnailHovered: isHistoryThumbnailHovered(card), timestamp: performance.now() }, getHistoryFallbackIdentityDiagnostics(videoId, card)));
+    forensicLog('HistoryNativeFallback', 'historyNativeFallbackTargetScheduled', Object.assign({ requestedVideoId: videoId, scheduledCardPresent: Boolean(card), scheduledCardConnected: Boolean(card && card.isConnected), scheduledCardTagName: card ? card.tagName : '', scheduledCardClassName: card ? String(card.className || '').slice(0, 160) : '', scheduledCardHovered: Boolean(card && (card.matches(':hover') || card.querySelector(':hover'))), scheduledThumbnailHovered: isThumbnailHovered(card), timestamp: performance.now() }, getHistoryFallbackIdentityDiagnostics(videoId, card)));
     logHistoryOwnershipEndSchedule(historyNativeFallbackSession ? historyNativeFallbackSession.generation : 'none', intentGeneration, 80, 'automatic-hover', historyNativeFallbackSession);
     historyNativeFallbackStartTimer = window.setTimeout(function () {
       historyNativeFallbackStartTimer = 0;
       const stillHovered = Boolean(card && (card.matches(':hover') || card.querySelector(':hover')));
-      const stillThumbnailHovered = isHistoryThumbnailHovered(card);
+      const stillThumbnailHovered = isThumbnailHovered(card);
       if (lastHoveredCard === card && intentGeneration === historyNativeFallbackIntentGeneration && card.isConnected && getVideoIdFromKey(getCardVideoKey(card)) === videoId && stillThumbnailHovered && videoId) {
         forensicLog('HistoryNativeFallback', 'historyNativeFallbackTargetValidated', Object.assign({ requestedVideoId: videoId, validatedSameObject: true, validatedCardConnected: true, validatedCardTagName: card.tagName, validatedCardClassName: String(card.className || '').slice(0, 160), validatedCardHovered: stillHovered, validatedThumbnailHovered: stillThumbnailHovered, timestamp: performance.now() }, getHistoryFallbackIdentityDiagnostics(videoId, card)));
         requestHistoryNativeFallback({ detail: { videoId: videoId, card: card } }, 'automatic-hover');
@@ -2577,6 +2742,10 @@
     }, 80);
   }
 
+  const queueNativePreviewFallback = queueHistoryNativeFallback;
+  const requestNativePreviewFallback = requestHistoryNativeFallback;
+  const cleanupNativePreviewFallback = cleanupHistoryNativeFallback;
+
   function handleCardHoverExit(event) {
     const target = isElement(event.target) ? event.target : null;
     const card = target ? target.closest(CARD_SELECTOR) : null;
@@ -2584,7 +2753,7 @@
     if (!card || card !== lastHoveredCard) {
       return;
     }
-    if (window.location.pathname === '/feed/history') {
+    if (isNativeFallbackSurface(window.location.pathname)) {
       const thumbnailHost = findThumbnailHost(card);
       const targetInThumbnail = Boolean(thumbnailHost && thumbnailHost.contains(event.target));
       const relatedInThumbnail = Boolean(thumbnailHost && isElement(event.relatedTarget) && thumbnailHost.contains(event.relatedTarget));
@@ -2596,18 +2765,18 @@
     }
     cancelHistoryNativeFallbackIntent('card-hover-exit');
     if (historyNativeFallbackSession && historyNativeFallbackSession.card === card) {
-      if (window.location.pathname === '/feed/history') {
+      if (isNativeFallbackSurface(window.location.pathname)) {
         const classification = logHistoryHoverLossCandidate(historyNativeFallbackSession);
         if (classification === 'CARD_STILL_HOVERED' || classification === 'POINTER_INSIDE_OVERLAY' ||
           classification === 'THUMBNAIL_REPLACED_SESSION_STILL_VALID' || classification === 'CANDIDATE_REPLACED_SESSION_STILL_VALID') {
           return;
         }
       }
-      const exitReason = window.location.pathname === '/feed/history' ? 'thumbnail-no-longer-hovered' : 'target-card-no-longer-hovered';
+      const exitReason = isNativeFallbackSurface(window.location.pathname) ? 'thumbnail-no-longer-hovered' : 'target-card-no-longer-hovered';
       logHistoryOwnershipEnd(historyNativeFallbackSession, exitReason);
       cleanupHistoryNativeFallback(exitReason);
     }
-    if (window.location.pathname === '/feed/history') {
+    if (isNativeFallbackSurface(window.location.pathname)) {
       lastHoveredCard = null;
     }
     if (homeYtActionProvenanceSession && homeYtActionProvenanceSession.card === card) {
@@ -3048,7 +3217,12 @@
       return;
     }
 
-    if (!state.controls.qualityMenu.hidden) {
+    if (
+      !state.controls.qualityMenu.hidden ||
+      state.seekDragging ||
+      state.timelineHovering ||
+      (state.overlay && state.overlay.contains(document.activeElement))
+    ) {
       scheduleOverlayControlsHide(state);
       return;
     }
@@ -5997,6 +6171,9 @@
 
     try {
       state.video[property] = value;
+      if (state.videoState && (property === 'muted' || property === 'volume' || property === 'playbackRate')) {
+        state.videoState[property] = value;
+      }
       return true;
     } catch (error) {
       reportError('set-video-' + property, error);
@@ -8219,10 +8396,16 @@
 
     installSeekEventForensics(state);
 
-    ['pointermove', 'pointerenter', 'pointerdown', 'touchstart', 'focusin'].forEach(function (eventName) {
+    ['pointermove', 'mousemove', 'pointerenter', 'mouseenter', 'pointerdown', 'touchstart', 'focusin'].forEach(function (eventName) {
+      registerListener(state.controlCleanup, state.elements.overlay, eventName, function () {
+        showOverlayControls(state);
+      });
       registerListener(state.controlCleanup, state.elements.frame, eventName, function () {
         showOverlayControls(state);
       });
+    });
+    registerListener(state.controlCleanup, state.elements.overlay, 'pointerleave', function () {
+      scheduleOverlayControlsHide(state);
     });
     registerListener(state.controlCleanup, state.elements.frame, 'pointerleave', function () {
       scheduleOverlayControlsHide(state);
@@ -8582,8 +8765,8 @@
     if (historyNativeFallbackSession && historyNativeFallbackSession.card === state.card) {
       const fallbackCard = historyNativeFallbackSession.card;
       cleanupHistoryNativeFallback('overlay-closed');
-      if (window.location.pathname === '/feed/history' && fallbackCard.isConnected &&
-        isHistoryThumbnailHovered(fallbackCard)) {
+      if (isNativeFallbackSurface(window.location.pathname) && fallbackCard.isConnected &&
+        isThumbnailHovered(fallbackCard)) {
         lastHoveredCard = fallbackCard;
         queueHistoryNativeFallback(fallbackCard);
       }
@@ -8815,19 +8998,19 @@
         return;
       }
 
+      if (isTextInputElement(event.target)) {
+        return;
+      }
+
       const isElementTarget = isElement(event.target);
       const isCloseTarget = isElementTarget && event.target.closest('.' + CLOSE_CLASS);
       const isActivationKey = isSpace || key === 'enter';
-      const isTextInputTarget = isElementTarget && (
-        event.target.tagName === 'TEXTAREA' ||
-        event.target.isContentEditable ||
-        (event.target.tagName === 'INPUT' && event.target !== state.controls.seekInput)
-      );
-      const isSeekControlKey = event.target === state.controls.seekInput &&
-        (isArrowLeft || isArrowRight);
-      if (isTextInputTarget ||
-        (isCloseTarget && isActivationKey) ||
-        isSeekControlKey) {
+      if (isCloseTarget && isActivationKey) {
+        return;
+      }
+
+      const isVolumeControl = event.target === state.controls.volumeInput;
+      if (isVolumeControl && (isArrowLeft || isArrowRight)) {
         return;
       }
 
@@ -8910,6 +9093,7 @@
       if (activeOverlay === state) {
         closePreviewOverlay({ restoreFocus: false });
       } else {
+        window.removeEventListener('keydown', state.handleKeydown, true);
         disarmPreviewAdGuard(state, 'overlay-mount-failed');
         clearSeekAssociation(state);
         if (state.placeholder.isConnected) {
@@ -8964,6 +9148,7 @@
     closePreviewOverlay({ restoreFocus: false });
     cancelHistoryNativeFallbackIntent();
     restoreButtonToCard();
+    logSurfaceDiagnostics('navigation');
     queueFullScan();
   }
 
@@ -9089,6 +9274,25 @@
       logHistoryOwnershipEndCancel: logHistoryOwnershipEndCancel,
       scheduleHistoryOwnershipEnd: scheduleHistoryOwnershipEnd,
       cancelHistoryOwnershipEnd: cancelHistoryOwnershipEnd,
+      detectCurrentSurface: detectCurrentSurface,
+      isNativeFallbackSurface: isNativeFallbackSurface,
+      isThumbnailHovered: isThumbnailHovered,
+      isMembersOnlyCard: isMembersOnlyCard,
+      MEMBERS_ONLY_MESSAGE: MEMBERS_ONLY_MESSAGE,
+      decorateCard: decorateCard,
+      getSurfaceDiagnostics: getSurfaceDiagnostics,
+      logSurfaceDiagnostics: logSurfaceDiagnostics,
+      requestNativePreviewFallback: requestNativePreviewFallback,
+      cleanupNativePreviewFallback: cleanupNativePreviewFallback,
+      queueNativePreviewFallback: queueNativePreviewFallback,
+      openPreviewOverlay: openPreviewOverlay,
+      closePreviewOverlay: closePreviewOverlay,
+      getActiveOverlay: function () {
+        return activeOverlay;
+      },
+      showOverlayControls: showOverlayControls,
+      hideOverlayControls: hideOverlayControls,
+      isTextInputElement: isTextInputElement,
       export: function () {
         return forensicLogBuffer.slice();
       },
@@ -9119,6 +9323,12 @@
     window.addEventListener('ytpm-debug-history-native-fallback', function (event) {
       requestHistoryNativeFallback(event);
     });
+    window.addEventListener('ytpm-debug-native-preview-fallback', function (event) {
+      requestNativePreviewFallback(event);
+    });
+    window.addEventListener('ytpm-debug-surface-diagnostics', function () {
+      logSurfaceDiagnostics('manual-event');
+    });
     window.addEventListener('ytpm-debug-dump', function () {
       const data = forensicLogBuffer.slice();
       console.debug('[YTPM][ForensicsJSON]\n' + JSON.stringify(data, null, 2));
@@ -9136,6 +9346,8 @@
         'ytpm-debug-caption-snapshot',
         'ytpm-debug-seek-snapshot',
         'ytpm-debug-history-native-fallback',
+        'ytpm-debug-native-preview-fallback',
+        'ytpm-debug-surface-diagnostics',
         'ytpm-debug-dump',
         'ytpm-debug-clear'
       ]
@@ -9151,6 +9363,7 @@
     installForensicDebugHelpers();
     injectPageBridge();
     scanCards(document);
+    logSurfaceDiagnostics('init');
     startObserver();
 
     document.addEventListener('mouseover', handleCardHover, true);

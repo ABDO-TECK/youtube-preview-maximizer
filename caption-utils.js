@@ -1116,19 +1116,27 @@
     return null;
   }
 
+  // MAX_CAPTION_CUES bounds memory consumption and prevents DOM / UI-thread
+  // exhaustion from oversized or maliciously crafted timed-text responses.
+  // Parsing halts immediately once MAX_CAPTION_CUES valid cues are collected,
+  // preserving valid cues parsed so far while invalid cues do not consume budget.
   function parseJsonCaptionCues(text) {
     try {
       const normalizedText = text
         .replace(/^\uFEFF/, '')
         .replace(/^\)\]\}'\s*/, '');
       const data = JSON.parse(normalizedText);
-      const events = Array.isArray(data.events)
-        ? data.events.slice(0, MAX_CAPTION_CUES)
-        : [];
+      const events = Array.isArray(data.events) ? data.events : [];
+      const cues = [];
 
-      return events.map(function (event, index) {
+      for (let index = 0; index < events.length; index += 1) {
+        if (cues.length >= MAX_CAPTION_CUES) {
+          break;
+        }
+
+        const event = events[index];
         if (!event || typeof event !== 'object') {
-          return null;
+          continue;
         }
 
         const start = Number(event.tStartMs) / 1000;
@@ -1144,25 +1152,31 @@
           }).join('').slice(0, MAX_CUE_TEXT_LENGTH)
           : '';
 
-        return {
-          start: start,
-          duration: duration,
-          text: textValue
-        };
-      }).filter(function (cue) {
-        return cue &&
-          Number.isFinite(cue.start) &&
-          cue.start >= 0 &&
-          Number.isFinite(cue.duration) &&
-          cue.duration > 0 &&
-          cue.duration <= 86400 &&
-          cue.text.trim();
-      });
+        if (
+          Number.isFinite(start) &&
+          start >= 0 &&
+          Number.isFinite(duration) &&
+          duration > 0 &&
+          duration <= 86400 &&
+          textValue.trim()
+        ) {
+          cues.push({
+            start: start,
+            duration: duration,
+            text: textValue
+          });
+        }
+      }
+
+      return cues;
     } catch (error) {
       return [];
     }
   }
 
+  // MAX_CAPTION_CUES bounds XML timed-text parsing to 5000 valid cues to
+  // mitigate memory spikes and DOM degradation from maliciously large payloads.
+  // Only valid cues increment the count toward MAX_CAPTION_CUES.
   function parseXmlCaptionCues(text) {
     if (typeof global.DOMParser !== 'function') {
       return [];
@@ -1170,24 +1184,36 @@
 
     try {
       const documentRoot = new global.DOMParser().parseFromString(text, 'text/xml');
-      return Array.from(documentRoot.querySelectorAll('text'))
-        .slice(0, MAX_CAPTION_CUES)
-        .map(function (node) {
-          const start = Number(node.getAttribute('start'));
-          const duration = Number(node.getAttribute('dur')) || 2;
-          return {
+      const nodes = documentRoot.querySelectorAll('text');
+      const cues = [];
+
+      for (let index = 0; index < nodes.length; index += 1) {
+        if (cues.length >= MAX_CAPTION_CUES) {
+          break;
+        }
+
+        const node = nodes[index];
+        const start = Number(node.getAttribute('start'));
+        const duration = Number(node.getAttribute('dur')) || 2;
+        const textValue = String(node.textContent || '').slice(0, MAX_CUE_TEXT_LENGTH);
+
+        if (
+          Number.isFinite(start) &&
+          start >= 0 &&
+          Number.isFinite(duration) &&
+          duration > 0 &&
+          duration <= 86400 &&
+          textValue.trim()
+        ) {
+          cues.push({
             start: start,
             duration: duration,
-            text: String(node.textContent || '').slice(0, MAX_CUE_TEXT_LENGTH)
-          };
-        }).filter(function (cue) {
-          return Number.isFinite(cue.start) &&
-            cue.start >= 0 &&
-            Number.isFinite(cue.duration) &&
-            cue.duration > 0 &&
-            cue.duration <= 86400 &&
-            cue.text.trim();
-        });
+            text: textValue
+          });
+        }
+      }
+
+      return cues;
     } catch (error) {
       return [];
     }

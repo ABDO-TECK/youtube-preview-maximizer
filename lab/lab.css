@@ -1,0 +1,4 @@
+body { font: 14px system-ui, sans-serif; margin: 2rem; background: #181818; color: #eee; }
+button, select { margin: .25rem; padding: .5rem; }
+pre { background: #0d0d0d; padding: 1rem; min-height: 12rem; white-space: pre-wrap; }
+.status { display: grid; grid-template-columns: repeat(2, minmax(12rem, 1fr)); gap: .5rem; max-width: 48rem; }

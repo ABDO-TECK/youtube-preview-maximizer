@@ -18,6 +18,10 @@
     'ytd-in-feed-ad-layout-renderer',
     'ytd-ad-layout-renderer',
     'ytd-advertisement-renderer',
+    'ytd-promoted-video-renderer',
+    'ytd-promoted-sparkles-text-search-renderer',
+    'ytd-companion-slot-renderer',
+    'ytd-player-legacy-desktop-watch-ads-renderer',
     'ytd-player-legacy-desktop-watch-ads-renderer',
     '[is-ad]',
     '[ad-placement]'
@@ -37,6 +41,7 @@
   const THUMBNAIL_CLASS = 'ytpm-thumbnail-host';
   const BUTTON_CLASS = 'ytpm-maximize-button';
   const PREVIEW_HOST_CLASS = 'ytpm-preview-host';
+  const HISTORY_FALLBACK_CLASS = 'ytpm-history-native-fallback-active';
   const PREVIEW_BUTTON_CLASS = 'ytpm-maximize-button--preview';
   const OVERLAY_CLASS = 'ytpm-overlay';
   const FRAME_CLASS = 'ytpm-overlay__frame';
@@ -81,6 +86,9 @@
   const CAPTION_TRANSITION_DURATION_MS = 140;
   const ACTIVE_VIDEO_ASSOCIATION_ATTRIBUTE = 'data-ytpm-active-video-association';
   const ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE = 'data-ytpm-active-player-association';
+  const PREVIEW_AD_SESSION_ATTRIBUTE = 'data-ytpm-preview-ad-session';
+  const PREVIEW_AD_VIDEO_ATTRIBUTE = 'data-ytpm-preview-ad-video-id';
+  const HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE = 'data-ytpm-history-fence';
   const SEEK_MAX_SECONDS = 86400;
   const CONTROLS_HIDE_DELAY_MS = 5000;
   const BRIDGE_ID_PATTERN = /^request-\d{1,12}$/;
@@ -88,7 +96,10 @@
   // this gate so it can be removed without changing the production paths.
   const DEBUG_LOGGING = true;
   const FORENSIC_LOG_LIMIT = 1500;
+  const documentInitialPathname = window.location.pathname;
+  const documentStartedAt = typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
   const captionUtils = globalThis.YTPMCaptionUtils || {};
+  const previewAdGuardFactory = globalThis.YTPMPreviewAdGuard || null;
 
   let activeOverlay = null;
   let observer = null;
@@ -99,6 +110,12 @@
   let previewAttemptId = 0;
   let lastHoveredCard = null;
   let previewButtonState = null;
+  let historyNativeFallbackSession = null;
+  let historyNativeFallbackPhase = 'entry';
+  let historyNativeFallbackStartTimer = 0;
+  let historyNativeFallbackIntentGeneration = 0;
+  let historyNativeFallbackGeneration = 0;
+  let homeYtActionProvenanceSession = null;
   let bridgeInjectionAttempted = false;
   let bridgeReady = false;
   let bridgeRequestCounter = 0;
@@ -109,6 +126,7 @@
   let lifecycleListenersInstalled = false;
   const cardButtonMap = new WeakMap();
   const cardPreviewVideoMap = new WeakMap();
+  const adCandidateReports = new WeakSet();
   const bridgeRequests = new Map();
   const bridgeReadyWaiters = [];
   const forensicLogBuffer = [];
@@ -270,15 +288,13 @@
     return Boolean(
       data &&
       data.source === PAGE_BRIDGE_SOURCE &&
-      data.nonce === pageBridgeNonce &&
-      (
-        data.type === 'ready' ||
+        data.nonce === pageBridgeNonce &&
         (
+          data.type === 'ready' ||
           data.type === 'response' &&
           typeof data.id === 'string' &&
           BRIDGE_ID_PATTERN.test(data.id)
         )
-      )
     );
   }
 
@@ -425,6 +441,39 @@
       return sanitizeSeekResult(result);
     }
 
+    if (command === 'preview-ad-status') {
+      if (!result || typeof result !== 'object' || Array.isArray(result)) {
+        return null;
+      }
+      return {
+        ok: result.ok === true,
+        active: result.active === true,
+        confidence: result.confidence === 'high' ? 'high' : 'none',
+        reason: typeof result.reason === 'string' ? result.reason.slice(0, 80) : 'unknown',
+        recovered: result.recovered === true,
+        requestedVideoIdMatches: result.requestedVideoIdMatches === true,
+        associationSource: typeof result.associationSource === 'string' ? result.associationSource.slice(0, 80) : 'unavailable',
+        associationAvailable: result.associationAvailable === true,
+        associationMatchesRequested: result.associationMatchesRequested === true,
+        playerReportedVideoIdPresent: result.playerReportedVideoIdPresent === true,
+        playerReportedVideoIdMatches: result.playerReportedVideoIdMatches === true,
+        playerState: Number.isFinite(result.playerState) ? result.playerState : null,
+        playerCurrentTime: Number.isFinite(result.playerCurrentTime) ? result.playerCurrentTime : null,
+        playerDuration: Number.isFinite(result.playerDuration) ? result.playerDuration : null,
+        loadedFraction: Number.isFinite(result.loadedFraction) ? result.loadedFraction : null,
+        playerVideoIdPresent: result.playerVideoIdPresent === true,
+        playerVideoIdMatchesRequested: result.playerVideoIdMatchesRequested === true,
+        invoked: result.invoked === true,
+        threw: result.threw === true,
+        command: typeof result.command === 'string' ? result.command.slice(0, 40) : '',
+        errorName: typeof result.errorName === 'string' ? result.errorName.slice(0, 80) : ''
+      };
+    }
+
+    if (command === 'history-native-fallback-prepare' || command === 'history-native-fallback-load' || command === 'history-ad-hold-break-load') {
+      return result && typeof result === 'object' && !Array.isArray(result) ? result : null;
+    }
+
     return null;
   }
 
@@ -529,7 +578,11 @@
       'fetch-captions',
       'captions-info',
       'set-captions-enabled',
-      'seek-preview'
+      'seek-preview',
+      'preview-ad-status',
+      'history-native-fallback-prepare',
+      'history-native-fallback-load',
+      'history-ad-hold-break-load',
     ].includes(command)) {
       return Promise.resolve(null);
     }
@@ -640,6 +693,18 @@
     return card.matches(AD_CARD_SELECTOR) || Boolean(card.querySelector(AD_CARD_SELECTOR));
   }
 
+  function reportAdCandidateRejected(card) {
+    if (!card || adCandidateReports.has(card)) {
+      return;
+    }
+    adCandidateReports.add(card);
+    console.debug('[YTPM][Ads]', 'ytpmAdCandidateRejected', {
+      renderer: card.tagName ? card.tagName.toLowerCase() : 'unknown',
+      surface: window.location.pathname === '/' ? 'home' : 'watch-or-other',
+      reason: 'structural-ad-renderer'
+    });
+  }
+
   function collectCards(root) {
     const cards = new Set();
 
@@ -696,6 +761,17 @@
 
     const watchLink = card.querySelector('a[href*="/watch"]');
     return resolveThumbnailHost(watchLink, card);
+  }
+
+  function isHistoryThumbnailHovered(card) {
+    if (!card || !isElement(card)) {
+      return false;
+    }
+    const thumbnailHost = findThumbnailHost(card);
+    return Boolean(thumbnailHost && (
+      thumbnailHost.matches(':hover') ||
+      thumbnailHost.querySelector(':hover')
+    ));
   }
 
   function hasVideoSource(video) {
@@ -759,6 +835,9 @@
   }
 
   function getCardVideoKey(card) {
+    if (!isElement(card) || typeof card.querySelector !== 'function') {
+      return null;
+    }
     const link = card.querySelector('a#thumbnail, a[href*="/watch"], a[href*="/shorts/"]');
     return link ? getVideoKey(link.href || link.getAttribute('href')) : null;
   }
@@ -932,6 +1011,22 @@
     }
 
     return null;
+  }
+
+  function getNativePreviewSourceScheme(video) {
+    const source = video && (video.currentSrc || video.src || '');
+    if (/^blob:/i.test(source)) {
+      return 'blob:';
+    }
+    if (/^https:/i.test(source)) {
+      return 'https:';
+    }
+    return source ? 'other:' : 'empty';
+  }
+
+  function getNativePreviewVideoId(player) {
+    const key = getVideoKeyFromPlayer(player);
+    return getVideoIdFromKey(key) || '';
   }
 
   function isPreviewAssociatedWithCard(card, preview) {
@@ -1111,8 +1206,12 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = BUTTON_CLASS;
-    button.setAttribute('aria-label', 'Maximize YouTube preview');
-    button.title = 'Maximize YouTube preview';
+    button.setAttribute('aria-label', window.location.pathname === '/feed/history'
+      ? 'Open in YTPM'
+      : 'Maximize YouTube preview');
+    button.title = window.location.pathname === '/feed/history'
+      ? 'Open in YTPM'
+      : 'Maximize YouTube preview';
     button.textContent = '⛶';
 
     button.addEventListener('click', function (event) {
@@ -1176,14 +1275,17 @@
     card.removeAttribute(PROCESSED_ATTRIBUTE);
 
     const thumbnailHost = findThumbnailHost(card);
-    if (!thumbnailHost || thumbnailHost.querySelector('.' + BUTTON_CLASS)) {
+    const buttonHost = thumbnailHost;
+    if (!buttonHost || buttonHost.querySelector('.' + BUTTON_CLASS)) {
       return;
     }
 
-    thumbnailHost.classList.add(THUMBNAIL_CLASS);
-    thumbnailHost.dataset.ytpmThumbnailHost = 'true';
+    if (thumbnailHost) {
+      thumbnailHost.classList.add(THUMBNAIL_CLASS);
+      thumbnailHost.dataset.ytpmThumbnailHost = 'true';
+    }
     const button = createMaximizeButton(card);
-    thumbnailHost.appendChild(button);
+    buttonHost.appendChild(button);
     cardButtonMap.set(card, button);
 
     card.classList.add(CARD_CLASS);
@@ -1232,7 +1334,11 @@
   function findCardForPreview(preview) {
     const previewKey = getPreviewVideoKey(preview);
     const cards = Array.from(collectCards(document)).filter(function (card) {
-      return !isAdCard(card);
+      const adCard = isAdCard(card);
+      if (adCard) {
+        reportAdCandidateRejected(card);
+      }
+      return !adCard;
     });
 
     if (previewKey) {
@@ -1263,10 +1369,10 @@
       return;
     }
 
-    const thumbnailHost = findThumbnailHost(state.card);
-    if (thumbnailHost) {
-      thumbnailHost.classList.add(THUMBNAIL_CLASS);
-      thumbnailHost.appendChild(state.button);
+    const buttonHost = findThumbnailHost(state.card);
+    if (buttonHost) {
+      buttonHost.classList.add(THUMBNAIL_CLASS);
+      buttonHost.appendChild(state.button);
     } else {
       state.button.remove();
     }
@@ -1306,17 +1412,514 @@
       cardPreviewVideoMap.set(card, previewVideo);
     }
 
-    activePreview.classList.add(PREVIEW_HOST_CLASS);
-    if (button.parentNode !== activePreview) {
-      activePreview.appendChild(button);
+    if (window.location.pathname !== '/feed/history') {
+      activePreview.classList.add(PREVIEW_HOST_CLASS);
+      if (button.parentNode !== activePreview) {
+        activePreview.appendChild(button);
+      }
+      button.classList.add(PREVIEW_BUTTON_CLASS);
     }
-    button.classList.add(PREVIEW_BUTTON_CLASS);
     previewButtonState = {
       card: card,
       preview: activePreview,
       button: button,
       video: previewVideo
     };
+  }
+
+  function logHistoryPreviewPrecursor(session, phase, details) {
+    if (!session || historyPreviewPrecursorSession !== session) return;
+    const fields = [
+      'phase=' + phase,
+      'generation=' + String(session.generation),
+      'elapsedMs=' + String(Math.max(0, Math.round(performance.now() - session.startedAt)))
+    ];
+    const extra = details || {};
+    if (phase === 'event') {
+      fields.push('event=' + String(extra.event));
+      if (extra.element) fields.push('element=' + extra.element);
+      if (extra.attribute) fields.push('attribute=' + extra.attribute);
+      if (typeof extra.active === 'boolean') fields.push('active=' + String(extra.active));
+    } else if (phase === 'end') {
+      fields.push(
+        'reason=' + String(extra.reason || 'cleanup'),
+        'sawYtAction=' + String(session.sawYtAction),
+        'sawPreviewShell=' + String(session.previewShellAssociated),
+        'attributeChangeCount=' + String(session.attributeChangeCount),
+        'structuralChangeCount=' + String(session.structuralChangeCount)
+      );
+    }
+    console.debug.apply(console, ['[YTPM][HistoryPreviewPrecursor]'].concat(fields));
+  }
+
+  function getHistoryPreviewPrecursorElementLabel(session, element) {
+    if (element === session.card) return 'card';
+    const thumbnailHost = session.thumbnailHost;
+    if (element === thumbnailHost) return 'thumbnail-host';
+    const lockupHost = session.card.matches('yt-lockup-view-model')
+      ? session.card
+      : session.card.querySelector('yt-lockup-view-model');
+    if (element === lockupHost) return 'other-known-host';
+    if (element && typeof element.closest === 'function' && element.closest('ytd-video-preview')) {
+      return 'preview';
+    }
+    return '';
+  }
+
+  function getHistoryPreviewPrecursorStructuralLabel(session, mutation) {
+    const directLabel = getHistoryPreviewPrecursorElementLabel(session, mutation.target);
+    if (directLabel) return directLabel;
+    const previewAdded = Array.from(mutation.addedNodes).some(function (node) {
+      return isElement(node) && (node.matches('ytd-video-preview') || node.querySelector('ytd-video-preview'));
+    });
+    return previewAdded ? 'preview' : '';
+  }
+
+  function removeHistoryPreviewPrecursorListeners(session) {
+    ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove', 'yt-action'].forEach(function (type) {
+      session.card.removeEventListener(type, session.eventListener, true);
+    });
+  }
+
+  function captureHistoryPreviewPrecursor(session) {
+    if (!session || historyPreviewPrecursorSession !== session) return false;
+    const preview = findActivePreview(session.card);
+    const associated = Boolean(preview && preview.isConnected &&
+      isPreviewAssociatedWithCard(session.card, preview));
+    if (associated && !session.previewShellAssociated) {
+      const active = preview.hasAttribute('active');
+      session.previewShellAssociated = true;
+      session.previewActiveAtAssociation = active;
+      logHistoryPreviewPrecursor(session, 'event', {
+        event: 'preview-shell-associated', active: active
+      });
+    }
+    return associated;
+  }
+
+  function stopHistoryPreviewPrecursor(session, reason) {
+    if (!session || historyPreviewPrecursorSession !== session) return;
+    if (session.hoverVerificationFrame) window.cancelAnimationFrame(session.hoverVerificationFrame);
+    captureHistoryPreviewPrecursor(session);
+    if (session.cardObserver) session.cardObserver.disconnect();
+    removeHistoryPreviewPrecursorListeners(session);
+    logHistoryPreviewPrecursor(session, 'end', { reason: reason });
+    historyPreviewPrecursorSession = null;
+  }
+
+  function verifyHistoryPreviewPrecursorHover(session) {
+    if (!session || historyPreviewPrecursorSession !== session || session.hoverVerificationFrame) return;
+    session.hoverVerificationFrame = window.requestAnimationFrame(function () {
+      session.hoverVerificationFrame = 0;
+      if (!session.card.isConnected) stopHistoryPreviewPrecursor(session, 'card-disconnected');
+      else if (!isHistoryThumbnailHovered(session.card)) {
+        stopHistoryPreviewPrecursor(session, 'verified-hover-lost');
+      }
+    });
+  }
+
+  function refreshHistoryPreviewPrecursor(session) {
+    const current = session || historyPreviewPrecursorSession;
+    if (!current || historyPreviewPrecursorSession !== current) return;
+    if (!current.card.isConnected) return stopHistoryPreviewPrecursor(current, 'card-disconnected');
+    if (getCardVideoKey(current.card) !== current.videoKey) return stopHistoryPreviewPrecursor(current, 'intent-replaced');
+    if (window.location.pathname !== '/feed/history') return stopHistoryPreviewPrecursor(current, 'navigation');
+    if (!isHistoryThumbnailHovered(current.card)) return verifyHistoryPreviewPrecursorHover(current);
+    captureHistoryPreviewPrecursor(current);
+  }
+
+  function startHistoryPreviewPrecursor(card, videoKey, intentGeneration) {
+    if (window.location.pathname !== '/feed/history' || !card || !card.isConnected || !videoKey) return;
+    stopHistoryPreviewPrecursor(historyPreviewPrecursorSession, 'intent-replaced');
+    const session = {
+      card: card,
+      videoKey: videoKey,
+      generation: intentGeneration,
+      startedAt: performance.now(),
+      cardObserver: null,
+      eventListener: null,
+      hoverVerificationFrame: 0,
+      seenEvents: new Set(),
+      seenAttributes: new Set(),
+      previewShellAssociated: false,
+      previewActiveAtAssociation: false,
+      thumbnailHost: findThumbnailHost(card),
+      sawYtAction: false,
+      attributeChangeCount: 0,
+      structuralChangeCount: 0
+    };
+    historyPreviewPrecursorSession = session;
+    session.eventListener = function (event) {
+      if (historyPreviewPrecursorSession !== session) return;
+      const eventName = event.type === 'yt-action' ? 'yt-action' : event.type;
+      if (event.type === 'yt-action') session.sawYtAction = true;
+      if (!session.seenEvents.has(eventName)) {
+        session.seenEvents.add(eventName);
+        logHistoryPreviewPrecursor(session, 'event', { event: eventName });
+      }
+    };
+    ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove', 'yt-action'].forEach(function (type) {
+      card.addEventListener(type, session.eventListener, { capture: true, passive: true });
+    });
+    logHistoryPreviewPrecursor(session, 'start');
+    if (typeof MutationObserver === 'function') {
+      session.cardObserver = new MutationObserver(function (mutations) {
+        if (historyPreviewPrecursorSession !== session) return;
+        mutations.forEach(function (mutation) {
+          if (mutation.type === 'attributes') {
+            const label = getHistoryPreviewPrecursorElementLabel(session, mutation.target);
+            const key = label && label + ':' + mutation.attributeName;
+            if (key && !session.seenAttributes.has(key)) {
+              session.seenAttributes.add(key);
+              session.attributeChangeCount += 1;
+              logHistoryPreviewPrecursor(session, 'event', {
+                event: 'attribute-change', element: label, attribute: mutation.attributeName
+              });
+            }
+          } else if (mutation.type === 'childList' && session.structuralChangeCount < 5) {
+            const label = getHistoryPreviewPrecursorStructuralLabel(session, mutation);
+            if (label) {
+              session.structuralChangeCount += 1;
+              logHistoryPreviewPrecursor(session, 'event', {
+                event: 'child-structure-change', element: label
+              });
+            }
+          }
+        });
+        refreshHistoryPreviewPrecursor(session);
+      });
+      session.cardObserver.observe(card, { attributes: true, childList: true, subtree: true });
+    }
+    refreshHistoryPreviewPrecursor(session);
+  }
+
+  function getHomeYtActionProvenanceLabel(session, element) {
+    if (!isElement(element)) return '';
+    if (element === session.card) return 'card';
+    if (element === session.thumbnailHost) return 'thumbnail-host';
+    return element.tagName ? element.tagName.toLowerCase() : '';
+  }
+
+  function stopHomeYtActionProvenance(session, reason) {
+    if (!session || homeYtActionProvenanceSession !== session) return;
+    if (session.timeoutTimer) window.clearTimeout(session.timeoutTimer);
+    if (session.hoverVerificationFrame) window.cancelAnimationFrame(session.hoverVerificationFrame);
+    session.targets.forEach(function (target) {
+      target.removeEventListener('yt-action', session.listener, true);
+    });
+    console.debug('[YTPM][HomeYtActionProvenance]',
+      'phase=end',
+      'generation=' + String(session.generation),
+      'elapsedMs=' + String(Math.max(0, Math.round(performance.now() - session.startedAt))),
+      'reason=' + reason);
+    homeYtActionProvenanceSession = null;
+  }
+
+  function verifyHomeYtActionProvenanceHover(session) {
+    if (!session || homeYtActionProvenanceSession !== session || session.hoverVerificationFrame) return;
+    session.hoverVerificationFrame = window.requestAnimationFrame(function () {
+      session.hoverVerificationFrame = 0;
+      if (!session.card.isConnected) stopHomeYtActionProvenance(session, 'card-disconnected');
+      else if (!(session.card.matches(':hover') || session.card.querySelector(':hover'))) {
+        stopHomeYtActionProvenance(session, 'verified-hover-lost');
+      }
+    });
+  }
+
+  function startHomeYtActionProvenance(card) {
+    if (window.location.pathname !== '/' || !card || !card.isConnected) return;
+    stopHomeYtActionProvenance(homeYtActionProvenanceSession, 'replaced');
+    const videoKey = getCardVideoKey(card);
+    const thumbnailHost = findThumbnailHost(card);
+    if (!videoKey || !thumbnailHost) return;
+    const session = {
+      card: card,
+      videoKey: videoKey,
+      thumbnailHost: thumbnailHost,
+      generation: (startHomeYtActionProvenance.generation || 0) + 1,
+      startedAt: performance.now(),
+      listener: null,
+      targets: [],
+      seenEvents: new WeakSet(),
+      timeoutTimer: 0,
+      hoverVerificationFrame: 0
+    };
+    startHomeYtActionProvenance.generation = session.generation;
+    homeYtActionProvenanceSession = session;
+    session.listener = function (event) {
+      if (homeYtActionProvenanceSession !== session || session.seenEvents.has(event)) return;
+      session.seenEvents.add(event);
+      const target = isElement(event.target) ? event.target : null;
+      const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+      const labels = [];
+      for (let index = 0; index < path.length && labels.length < 8; index += 1) {
+        const node = path[index];
+        if (!isElement(node)) continue;
+        const label = getHomeYtActionProvenanceLabel(session, node);
+        if (label) labels.push(label);
+        if (node === session.card) break;
+      }
+      const fields = [
+        '[YTPM][HomeYtActionProvenance]', 'phase=event',
+        'generation=' + String(session.generation),
+        'elapsedMs=' + String(Math.max(0, Math.round(performance.now() - session.startedAt))),
+        'event=yt-action',
+        'target=' + String(getHomeYtActionProvenanceLabel(session, target) || 'unknown'),
+        'targetInsideThumbnail=' + String(Boolean(target && session.thumbnailHost.contains(target))),
+        'targetInsideCard=' + String(Boolean(target && session.card.contains(target))),
+        'bubbles=' + String(Boolean(event.bubbles)),
+        'composed=' + String(Boolean(event.composed)),
+        'eventPhase=' + String(event.eventPhase),
+        'path=' + labels.join('>')
+      ];
+      try {
+        if (event.detail && typeof event.detail === 'object' && !Array.isArray(event.detail)) {
+          const keys = Object.keys(event.detail).slice(0, 10).filter(function (key) { return key.length <= 80; });
+          if (keys.length) fields.push('detailKeys=' + keys.join(','));
+        }
+      } catch (error) {}
+      console.debug.apply(console, fields);
+      stopHomeYtActionProvenance(session, 'yt-action-captured');
+    };
+    session.targets = [thumbnailHost, card].filter(function (target, index, targets) {
+      return targets.indexOf(target) === index;
+    });
+    session.targets.forEach(function (target) {
+      target.addEventListener('yt-action', session.listener, { capture: true, passive: true });
+    });
+    console.debug('[YTPM][HomeYtActionProvenance]', 'phase=start',
+      'generation=' + String(session.generation), 'elapsedMs=0');
+    session.timeoutTimer = window.setTimeout(function () {
+      stopHomeYtActionProvenance(session, 'timeout');
+    }, 250);
+  }
+
+  function stopHomeYtActionTargetLifecycle(session, reason) {
+    if (!session || globalThis.__ytpmHomeTargetLifecycle !== session) return;
+    if (session.timer) window.clearTimeout(session.timer);
+    if (session.observer) session.observer.disconnect();
+    if (session.frame) window.cancelAnimationFrame(session.frame);
+    session.card.removeEventListener('yt-action', session.listener, true);
+    console.debug('[YTPM][HomeYtActionTargetLifecycle]', 'phase=end',
+      'generation=' + session.generation, 'elapsedMs=' + Math.round(performance.now() - session.startedAt),
+      'reason=' + reason);
+    globalThis.__ytpmHomeTargetLifecycle = null;
+  }
+
+  function startHomeYtActionTargetLifecycle(card) {
+    if (window.location.pathname !== '/' || !card || !card.isConnected) return;
+    stopHomeYtActionTargetLifecycle(globalThis.__ytpmHomeTargetLifecycle, 'replaced');
+    const thumbnailHost = findThumbnailHost(card);
+    const videoKey = getCardVideoKey(card);
+    if (!thumbnailHost || !videoKey) return;
+    const initial = new Set(Array.from(card.children));
+    const session = {
+      card: card, thumbnailHost: thumbnailHost, videoKey: videoKey,
+      generation: (startHomeYtActionTargetLifecycle.generation || 0) + 1,
+      startedAt: performance.now(), initial: initial, added: new Set(), removed: new Set(),
+      addedLogs: 0, removedLogs: 0, listener: null, observer: null, timer: 0, frame: 0
+    };
+    startHomeYtActionTargetLifecycle.generation = session.generation;
+    globalThis.__ytpmHomeTargetLifecycle = session;
+    const log = function (event) {
+      console.debug('[YTPM][HomeYtActionTargetLifecycle]', 'phase=event',
+        'generation=' + session.generation, 'elapsedMs=' + Math.round(performance.now() - session.startedAt), 'event=' + event);
+    };
+    console.debug('[YTPM][HomeYtActionTargetLifecycle]', 'phase=start',
+      'generation=' + session.generation, 'elapsedMs=0', 'directElementChildCount=' + card.children.length);
+    session.observer = new MutationObserver(function (mutations) {
+      mutations.forEach(function (mutation) {
+        mutation.addedNodes.forEach(function (node) {
+          if (isElement(node)) { session.added.add(node); if (session.addedLogs++ < 2) log('direct-child-added'); }
+        });
+        mutation.removedNodes.forEach(function (node) {
+          if (isElement(node)) { session.removed.add(node); if (session.removedLogs++ < 2) log('direct-child-removed'); }
+        });
+      });
+    });
+    session.observer.observe(card, { childList: true });
+    session.listener = function (event) {
+      if (globalThis.__ytpmHomeTargetLifecycle !== session) return;
+      const target = isElement(event.target) ? event.target : null;
+      if (!target) return;
+      const attributes = Array.from(target.attributes).map(function (attribute) { return attribute.name; }).sort().slice(0, 10);
+      const index = Array.prototype.indexOf.call(card.children, target);
+      console.debug('[YTPM][HomeYtActionTargetLifecycle]', 'phase=event',
+        'generation=' + session.generation, 'elapsedMs=' + Math.round(performance.now() - session.startedAt),
+        'event=yt-action-target', 'targetTag=' + target.tagName.toLowerCase(),
+        'targetInsideCard=' + card.contains(target), 'targetInsideThumbnail=' + thumbnailHost.contains(target),
+        'targetDirectChildOfCard=' + (target.parentElement === card), 'targetPresentAtStart=' + initial.has(target),
+        'targetAddedDuringProbe=' + session.added.has(target), 'targetRemovedDuringProbe=' + session.removed.has(target),
+        'targetElementIndex=' + index, 'targetContainsThumbnail=' + target.contains(thumbnailHost),
+        'thumbnailContainsTarget=' + thumbnailHost.contains(target), 'childElementCount=' + target.children.length,
+        'hasShadowRoot=' + Boolean(target.shadowRoot), 'attributeNames=' + attributes.join(','),
+        'hasIdAttribute=' + target.hasAttribute('id'), 'hasClassAttribute=' + target.hasAttribute('class'));
+      stopHomeYtActionTargetLifecycle(session, 'yt-action-target-captured');
+    };
+    card.addEventListener('yt-action', session.listener, { capture: true, passive: true });
+    session.timer = window.setTimeout(function () { stopHomeYtActionTargetLifecycle(session, 'timeout'); }, 250);
+  }
+
+  function verifyHomeYtActionTargetLifecycleHover(session) {
+    if (!session || globalThis.__ytpmHomeTargetLifecycle !== session || session.frame) return;
+    session.frame = window.requestAnimationFrame(function () {
+      session.frame = 0;
+      if (!session.card.isConnected) stopHomeYtActionTargetLifecycle(session, 'card-disconnected');
+      else if (!(session.card.matches(':hover') || session.card.querySelector(':hover'))) {
+        stopHomeYtActionTargetLifecycle(session, 'verified-hover-lost');
+      }
+    });
+  }
+
+  function startHomeYtActionIdentity(card) {
+    if (window.location.pathname !== '/' || !card || !card.isConnected) return;
+    const thumbnailHost = findThumbnailHost(card);
+    const candidates = thumbnailHost ? Array.from(card.children).filter(function (child) { return child.tagName === 'DIV' && child.contains(thumbnailHost); }) : [];
+    if (candidates.length !== 1) return;
+    const target = candidates[0];
+    const session = { card: card, target: target, startedAt: performance.now(), generation: (startHomeYtActionIdentity.generation || 0) + 1, timer: 0, listener: null };
+    startHomeYtActionIdentity.generation = session.generation;
+    console.debug('[YTPM][HomeYtActionIdentity]', 'phase=start', 'generation=' + session.generation, 'elapsedMs=0', 'candidateCount=1', 'targetElementIndex=' + Array.prototype.indexOf.call(card.children, target));
+    const stop = function (reason, found) {
+      if (session.timer) window.clearTimeout(session.timer);
+      target.removeEventListener('yt-action', session.listener, true);
+      console.debug('[YTPM][HomeYtActionIdentity]', 'phase=end', 'generation=' + session.generation, 'elapsedMs=' + Math.round(performance.now() - session.startedAt), 'reason=' + reason, 'identityFound=' + Boolean(found));
+    };
+    session.listener = function (event) {
+      const detail = event.detail;
+      const fields = ['[YTPM][HomeYtActionIdentity]', 'phase=event', 'generation=' + session.generation,
+        'elapsedMs=' + Math.round(performance.now() - session.startedAt), 'event=yt-action-identity',
+        'targetTag=' + target.tagName.toLowerCase(), 'targetElementIndex=' + Array.prototype.indexOf.call(card.children, target),
+        'detailPresent=' + Boolean(detail), 'detailType=' + typeof detail];
+      let found = false;
+      try {
+        if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
+          const keys = Object.keys(detail).slice(0, 12);
+          fields.push('detailKeys=' + keys.join(','));
+          ['actionName', 'action', 'name', 'type', 'command', 'commandName', 'eventType'].forEach(function (key) {
+            if (!Object.prototype.hasOwnProperty.call(detail, key)) return;
+            const value = detail[key];
+            if (typeof value === 'string' && value.length <= 120 && !/^https?:\/\//i.test(value) && !/\/(watch|shorts)\b/i.test(value) && !/[A-Za-z0-9_-]{11}/.test(value)) {
+              fields.push(key + '=' + value); found = true;
+            } else if ((key === 'action' || key === 'command') && value && typeof value === 'object' && !Array.isArray(value)) {
+              const nested = Object.keys(value).slice(0, 10);
+              if (nested.length) fields.push(key + 'Keys=' + nested.join(','));
+            }
+          });
+        }
+      } catch (error) {}
+      console.debug.apply(console, fields);
+      stop(found ? 'identity-captured' : 'identity-unavailable', found);
+    };
+    target.addEventListener('yt-action', session.listener, { capture: true, passive: true });
+    session.timer = window.setTimeout(function () { stop('timeout', false); }, 250);
+  }
+
+  function snapshotPreviewHandlerSurface(card, surface, generation) {
+    const thumbnail = findThumbnailHost(card);
+    const matches = thumbnail ? Array.from(card.children).filter(function (child) { return child.tagName === 'DIV' && child.contains(thumbnail); }) : [];
+    const candidate = matches.length === 1 ? matches[0] : null;
+    const keywords = /preview|hover|action|inline|player|open/i;
+    const names = function (value, limit) { try { return Object.getOwnPropertyNames(value).filter(function (name) { return keywords.test(name); }).slice(0, limit); } catch (error) { return []; } };
+    const methods = function (value, levels) { const output = []; let proto = Object.getPrototypeOf(value); for (let i = 0; proto && i < levels && proto !== HTMLElement.prototype; i += 1, proto = Object.getPrototypeOf(proto)) { const descriptors = Object.getOwnPropertyDescriptors(proto); Object.keys(descriptors).forEach(function (name) { if (keywords.test(name) && typeof descriptors[name].value === 'function' && output.indexOf(name) < 0) output.push(name); }); } return output.slice(0, 25); };
+    const states = function (value) { const output = []; let proto = Object.getPrototypeOf(value); for (let i = 0; proto && i < 4 && proto !== HTMLElement.prototype; i += 1, proto = Object.getPrototypeOf(proto)) { const descriptors = Object.getOwnPropertyDescriptors(proto); Object.keys(descriptors).forEach(function (name) { if (keywords.test(name) && typeof descriptors[name].value !== 'function' && output.indexOf(name) < 0) output.push(name); }); } return output.slice(0, 20); };
+    const attrs = function (element) { return element ? Array.from(element.attributes).map(function (attribute) { return attribute.name; }).sort().slice(0, 15) : []; };
+    const custom = candidate ? Array.from(candidate.querySelectorAll('*')).filter(function (element) { return element.tagName.includes('-'); }).map(function (element) { return element.tagName.toLowerCase(); }).filter(function (tag, index, all) { return all.indexOf(tag) === index; }).slice(0, 12) : [];
+    console.debug('[YTPM][PreviewHandlerSurface]', 'phase=snapshot', 'surface=' + surface, 'generation=' + generation,
+      'cardTag=' + card.tagName.toLowerCase(), 'directElementChildCount=' + card.children.length, 'candidateCount=' + matches.length,
+      'candidateElementIndex=' + (candidate ? Array.prototype.indexOf.call(card.children, candidate) : -1), 'candidateChildElementCount=' + (candidate ? candidate.children.length : 0),
+      'candidateChildTags=' + (candidate ? Array.from(candidate.children).slice(0, 8).map(function (child) { return child.tagName.toLowerCase(); }).join(',') : ''),
+      'candidateCustomTags=' + custom.join(','), 'thumbnailTag=' + (thumbnail ? thumbnail.tagName.toLowerCase() : ''),
+      'cardAttributeNames=' + attrs(card).join(','), 'candidateAttributeNames=' + attrs(candidate).join(','), 'thumbnailAttributeNames=' + attrs(thumbnail).join(','),
+      'cardRelevantOwnProps=' + names(card, 20).join(','), 'thumbnailRelevantOwnProps=' + names(thumbnail, 20).join(','),
+      'cardRelevantMethods=' + methods(card, 4).join(','), 'thumbnailRelevantMethods=' + methods(thumbnail, 4).join(','),
+      'cardRelevantStateNames=' + states(card).join(','), 'thumbnailRelevantStateNames=' + states(thumbnail).join(','));
+    custom.slice(0, 6).forEach(function (tag) { const element = candidate.querySelector(tag); const found = methods(element, 3); if (found.length) console.debug('[YTPM][PreviewHandlerSurface]', 'phase=component', 'surface=' + surface, 'generation=' + generation, 'tag=' + tag, 'relevantMethods=' + found.join(',')); });
+    console.debug('[YTPM][PreviewHandlerSurface]', 'phase=end', 'surface=' + surface, 'generation=' + generation, 'reason=snapshot-complete');
+  }
+
+  function snapshotPreviewEligibilityState(card, surface, generation) {
+    const thumbnail = findThumbnailHost(card);
+    const candidate = thumbnail && Array.from(card.children).filter(function (child) { return child.tagName === 'DIV' && child.contains(thumbnail); });
+    const target = candidate && candidate.length === 1 ? candidate[0] : null;
+    const safeTokens = function (element) { return element ? Array.from(element.classList).filter(function (token) { return token.length <= 80 && !/http|\/|\?|=|[A-Za-z0-9_-]{11}/i.test(token); }).sort().slice(0, 15) : []; };
+    const attrs = function (element) { const out = {}; ['hidden', 'disabled', 'inert', 'tabindex', 'role', 'aria-disabled', 'aria-hidden'].forEach(function (name) { if (!element) return; const value = element.getAttribute(name); if (name === 'tabindex' && /^-?\d{1,3}$/.test(value || '')) out[name] = value; else if (name === 'role' && /^[a-z-]{1,32}$/.test(value || '')) out[name] = value; else if (/^aria-/.test(name) && /^(true|false)$/.test(value || '')) out[name] = value; else out[name] = element.hasAttribute(name); }); return Object.keys(out).map(function (key) { return key + '=' + out[key]; }).join(','); };
+    const own = function (element) { try { return Object.getOwnPropertyNames(element).filter(function (name) { return !/ytpm/i.test(name); }).slice(0, 40); } catch (error) { return []; } };
+    const datasets = function (element) { return element ? Object.keys(element.dataset).slice(0, 15) : []; };
+    console.debug('[YTPM][PreviewEligibilityState]', 'phase=snapshot', 'surface=' + surface, 'generation=' + generation,
+      'cardTag=' + card.tagName.toLowerCase(), 'candidateElementIndex=' + (target ? Array.prototype.indexOf.call(card.children, target) : -1),
+      'cardClassTokens=' + safeTokens(card).join(','), 'candidateClassTokens=' + safeTokens(target).join(','), 'thumbnailClassTokens=' + safeTokens(thumbnail).join(','),
+      'cardDatasetKeys=' + datasets(card).join(','), 'candidateDatasetKeys=' + datasets(target).join(','), 'thumbnailDatasetKeys=' + datasets(thumbnail).join(','),
+      'cardOwnPropertyNames=' + own(card).join(','), 'thumbnailOwnPropertyNames=' + own(thumbnail).join(','),
+      'cardOwnSymbolCount=' + Object.getOwnPropertySymbols(card).length, 'thumbnailOwnSymbolCount=' + Object.getOwnPropertySymbols(thumbnail).length,
+      'hasProgressOverlay=' + Boolean(target && target.querySelector('yt-thumbnail-overlay-progress-bar-view-model')),
+      'cardInteractionState=' + attrs(card), 'candidateInteractionState=' + attrs(target), 'thumbnailInteractionState=' + attrs(thumbnail));
+    if (target) Array.from(target.children).slice(0, 3).forEach(function (child, index) { console.debug('[YTPM][PreviewEligibilityState]', 'phase=child', 'surface=' + surface, 'generation=' + generation, 'index=' + index, 'tag=' + child.tagName.toLowerCase(), 'classTokens=' + safeTokens(child).join(','), 'attributeNames=' + Array.from(child.attributes).map(function (attribute) { return attribute.name; }).sort().slice(0, 12).join(',')); });
+    console.debug('[YTPM][PreviewEligibilityState]', 'phase=end', 'surface=' + surface, 'generation=' + generation, 'reason=snapshot-complete');
+  }
+
+  function resolveHistoryYtActionTargetCandidate(card, thumbnailHost) {
+    const matches = Array.from(card.children).filter(function (child) {
+      return child.tagName === 'DIV' && child.contains(thumbnailHost);
+    });
+    return { count: matches.length, candidate: matches.length === 1 ? matches[0] : null };
+  }
+
+  function stopHistoryYtActionTargetMirror(session, reason) {
+    if (!session || globalThis.__ytpmHistoryTargetMirror !== session) return;
+    if (session.observer) session.observer.disconnect();
+    if (session.frame) window.cancelAnimationFrame(session.frame);
+    if (session.candidate) ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove', 'yt-action'].forEach(function (type) {
+      session.candidate.removeEventListener(type, session.listener, true);
+    });
+    const end = resolveHistoryYtActionTargetCandidate(session.card, session.thumbnailHost);
+    console.debug('[YTPM][HistoryYtActionTargetMirror]', 'phase=end', 'generation=' + session.generation,
+      'elapsedMs=' + Math.round(performance.now() - session.startedAt), 'reason=' + reason,
+      'candidatePresentAtStart=' + Boolean(session.candidate), 'candidatePresentAtEnd=' + Boolean(end.candidate),
+      'candidateCountAtEnd=' + end.count, 'sameCandidateAtEnd=' + Boolean(end.candidate && end.candidate === session.candidate),
+      'sawCandidatePointerOrMouse=' + session.sawPointerOrMouse, 'sawCandidateYtAction=' + session.sawYtAction,
+      'candidateElementIndexAtEnd=' + (end.candidate ? Array.prototype.indexOf.call(session.card.children, end.candidate) : -1),
+      'candidateChildElementCountAtEnd=' + (end.candidate ? end.candidate.children.length : 0));
+    globalThis.__ytpmHistoryTargetMirror = null;
+  }
+
+  function startHistoryYtActionTargetMirror(card, videoKey, generation) {
+    if (window.location.pathname !== '/feed/history' || !card || !videoKey) return;
+    stopHistoryYtActionTargetMirror(globalThis.__ytpmHistoryTargetMirror, 'intent-replaced');
+    const thumbnailHost = findThumbnailHost(card);
+    if (!thumbnailHost) return;
+    const resolved = resolveHistoryYtActionTargetCandidate(card, thumbnailHost);
+    const candidate = resolved.candidate;
+    const session = { card: card, videoKey: videoKey, thumbnailHost: thumbnailHost, generation: generation,
+      startedAt: performance.now(), candidate: candidate, observer: null, listener: null, frame: 0,
+      seen: new Set(), sawPointerOrMouse: false, sawYtAction: false };
+    globalThis.__ytpmHistoryTargetMirror = session;
+    const attributes = candidate ? Array.from(candidate.attributes).map(function (attribute) { return attribute.name; }).sort().slice(0, 10) : [];
+    console.debug('[YTPM][HistoryYtActionTargetMirror]', 'phase=start', 'generation=' + generation, 'elapsedMs=0',
+      'directElementChildCount=' + card.children.length, 'candidateCount=' + resolved.count, 'candidatePresent=' + Boolean(candidate),
+      'candidateTag=' + (candidate ? candidate.tagName.toLowerCase() : ''), 'candidateElementIndex=' + (candidate ? Array.prototype.indexOf.call(card.children, candidate) : -1),
+      'candidateContainsThumbnail=' + Boolean(candidate && candidate.contains(thumbnailHost)), 'thumbnailContainsCandidate=' + Boolean(candidate && thumbnailHost.contains(candidate)),
+      'candidateChildElementCount=' + (candidate ? candidate.children.length : 0), 'candidateHasShadowRoot=' + Boolean(candidate && candidate.shadowRoot),
+      'candidateAttributeNames=' + attributes.join(','), 'candidateHasIdAttribute=' + Boolean(candidate && candidate.hasAttribute('id')),
+      'candidateHasClassAttribute=' + Boolean(candidate && candidate.hasAttribute('class')));
+    session.listener = function (event) {
+      const name = 'candidate-' + event.type;
+      if (globalThis.__ytpmHistoryTargetMirror !== session || session.seen.has(name)) return;
+      session.seen.add(name); session.sawYtAction = session.sawYtAction || event.type === 'yt-action';
+      session.sawPointerOrMouse = session.sawPointerOrMouse || event.type !== 'yt-action';
+      console.debug('[YTPM][HistoryYtActionTargetMirror]', 'phase=event', 'generation=' + generation,
+        'elapsedMs=' + Math.round(performance.now() - session.startedAt), 'event=' + name);
+    };
+    if (candidate) ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove', 'yt-action'].forEach(function (type) {
+      candidate.addEventListener(type, session.listener, { capture: true, passive: true });
+    });
+    session.observer = new MutationObserver(function (mutations) {
+      mutations.forEach(function (mutation) {
+        mutation.addedNodes.forEach(function (node) { if (node === session.candidate) console.debug('[YTPM][HistoryYtActionTargetMirror]', 'phase=event', 'generation=' + generation, 'elapsedMs=' + Math.round(performance.now() - session.startedAt), 'event=candidate-added'); });
+        mutation.removedNodes.forEach(function (node) { if (node === session.candidate) console.debug('[YTPM][HistoryYtActionTargetMirror]', 'phase=event', 'generation=' + generation, 'elapsedMs=' + Math.round(performance.now() - session.startedAt), 'event=candidate-removed'); });
+      });
+    });
+    session.observer.observe(card, { childList: true });
   }
 
   function handleCardHover(event) {
@@ -1326,8 +1929,691 @@
       return;
     }
 
+    if (window.location.pathname === '/feed/history' && !isHistoryThumbnailHovered(card)) {
+      return;
+    }
+
     lastHoveredCard = card;
+    if (window.location.pathname === '/') { snapshotPreviewEligibilityState.generation = (snapshotPreviewEligibilityState.generation || 0) + 1; snapshotPreviewEligibilityState(card, 'home', snapshotPreviewEligibilityState.generation); }
     schedulePreviewSync();
+    queueHistoryNativeFallback(card);
+  }
+
+  function getHistoryFallbackIdentityDiagnostics(videoId, scheduledCard) {
+    const candidates = Array.from(collectCards(document)).filter(function (candidate) { return getVideoIdFromKey(getCardVideoKey(candidate)) === videoId; });
+    return { sameVideoCandidateCount: candidates.length, sameVideoHoveredCandidateCount: candidates.filter(function (candidate) { return candidate.matches(':hover') || Boolean(candidate.querySelector(':hover')); }).length, candidates: candidates.slice(0, 5).map(function (candidate) { return { tagName: candidate.tagName, className: String(candidate.className || '').slice(0, 160), connected: Boolean(candidate.isConnected), hovered: Boolean(candidate.matches(':hover') || candidate.querySelector(':hover')), isScheduledCard: candidate === scheduledCard }; }) };
+  }
+
+  function logHistoryNativeFallback(eventName, details) {
+    forensicLog('HistoryNativeFallback', eventName, details || {});
+  }
+
+  function logHistoryExplicitOverlay(eventName, details) {
+    forensicLog('HistoryExplicitOverlay', eventName, Object.assign({
+      pathname: window.location.pathname,
+      timestamp: Date.now()
+    }, details || {}));
+  }
+
+  function logAdGuardLifecycle(phase, state, reason) {
+    console.debug('[YTPM][AdGuard]',
+      'phase=' + phase,
+      'generation=' + String(state && state.generation != null ? state.generation : ''),
+      'surface=' + String(state && state.surface ? state.surface : 'unknown'),
+      'videoId=' + String(state && state.videoId ? state.videoId : ''),
+      reason ? 'reason=' + reason : '');
+  }
+
+  function cancelHistoryNativeFallbackIntent(reason) {
+    if (historyNativeFallbackStartTimer) {
+      window.clearTimeout(historyNativeFallbackStartTimer);
+      historyNativeFallbackStartTimer = 0;
+      logHistoryOwnershipEndCancel(historyNativeFallbackSession ? historyNativeFallbackSession.generation : 'none', historyNativeFallbackIntentGeneration, reason || 'intent-cancelled');
+    }
+    historyNativeFallbackIntentGeneration += 1;
+  }
+
+  function isPointInsideElement(element, point) {
+    if (!element || !element.isConnected || !point || !Number.isFinite(point.x) || !Number.isFinite(point.y) || typeof element.getBoundingClientRect !== 'function') return false;
+    const rect = element.getBoundingClientRect();
+    return Boolean(rect && point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom);
+  }
+
+  function elementHovered(element) {
+    return Boolean(element && element.isConnected && typeof element.matches === 'function' && (element.matches(':hover') || (typeof element.querySelector === 'function' && element.querySelector(':hover'))));
+  }
+
+  function getHistoryHoverEvidence(session) {
+    const card = session && session.card;
+    const thumbnail = card && findThumbnailHost(card);
+    const candidate = card && thumbnail ? resolveHistoryYtActionTargetCandidate(card, thumbnail) : null;
+    const preview = session && session.nativePreview;
+    const overlay = session && session.overlay;
+    const point = session && session.lastPointer;
+    const ownershipValid = Boolean(session && historyNativeFallbackSession === session && session.generation === historyNativeFallbackGeneration && session.active && card && card.isConnected && preview && preview.isConnected);
+    return {
+      cardConnected: Boolean(card && card.isConnected), thumbnailConnected: Boolean(thumbnail && thumbnail.isConnected), candidateConnected: Boolean(candidate && candidate.isConnected), previewConnected: Boolean(preview && preview.isConnected),
+      cardHovered: elementHovered(card), thumbnailHovered: elementHovered(thumbnail), candidateHovered: elementHovered(candidate), previewHovered: elementHovered(preview), overlayHovered: elementHovered(overlay),
+      pointerInsideCardBounds: isPointInsideElement(card, point), pointerInsideThumbnailBounds: isPointInsideElement(thumbnail, point), pointerInsideOverlayBounds: isPointInsideElement(overlay, point),
+      generationCurrent: Boolean(session && session.generation === historyNativeFallbackGeneration), sessionCurrent: Boolean(session && historyNativeFallbackSession === session), ownershipValid: ownershipValid
+    };
+  }
+
+  function classifyHistoryHoverLoss(evidence) {
+    if (!evidence.sessionCurrent || !evidence.generationCurrent) return 'SESSION_STALE';
+    if (!evidence.ownershipValid) return 'OWNERSHIP_LOST';
+    if (evidence.overlayHovered || evidence.pointerInsideOverlayBounds) return 'POINTER_INSIDE_OVERLAY';
+    if (evidence.cardHovered || evidence.pointerInsideCardBounds) return 'CARD_STILL_HOVERED';
+    if (!evidence.thumbnailConnected) return 'THUMBNAIL_REPLACED_SESSION_STILL_VALID';
+    if (!evidence.candidateConnected) return 'CANDIDATE_REPLACED_SESSION_STILL_VALID';
+    return 'REAL_POINTER_EXIT';
+  }
+
+  function logHistoryHoverLossCandidate(session) {
+    const evidence = getHistoryHoverEvidence(session);
+    const classification = classifyHistoryHoverLoss(evidence);
+    console.debug('[YTPM][AdHover]', 'generation=' + String(session && session.generation), 'phase=loss-candidate', 'classification=' + classification, evidence);
+    return classification;
+  }
+
+  function isHistoryFallbackInteractionValid(session) {
+    const evidence = getHistoryHoverEvidence(session);
+    return evidence.ownershipValid && (evidence.thumbnailHovered || evidence.cardHovered || evidence.overlayHovered || evidence.pointerInsideCardBounds || evidence.pointerInsideOverlayBounds);
+  }
+
+  let historyFallbackPendingCleanup = null;
+
+  function logHistoryOwnershipEnd(session, reason, timerContext) {
+    if (session && session.ownershipEndLogged) {
+      return;
+    }
+    if (session) {
+      session.ownershipEndLogged = true;
+    }
+
+    const card = session && session.card;
+    const thumbnail = card && findThumbnailHost(card);
+    const outer = session && (session.outer || document.querySelector('ytd-player#inline-player'));
+    const inner = session && (session.inner || (outer && outer.querySelector('#inline-preview-player.html5-video-player')));
+    const overlay = (session && session.overlay) || outer;
+    const point = session && session.lastPointer;
+    const pointerInOverlay = Boolean(isPointInsideElement(overlay, point) || elementHovered(overlay));
+    const pointerInCard = Boolean(isPointInsideElement(card, point));
+    const pointerInThumbnail = Boolean(isPointInsideElement(thumbnail, point));
+    const sessionCurrent = Boolean(session && historyNativeFallbackSession === session);
+
+    const parts = [
+      'generation=' + String(session && session.generation != null ? session.generation : 'none'),
+      'currentFallbackGeneration=' + String(historyNativeFallbackGeneration),
+      'sessionStillCurrent=' + String(sessionCurrent),
+      'cardConnected=' + String(Boolean(card && card.isConnected)),
+      'thumbnailConnected=' + String(Boolean(thumbnail && thumbnail.isConnected)),
+      'outerConnected=' + String(Boolean(outer && outer.isConnected)),
+      'innerConnected=' + String(Boolean(inner && inner.isConnected)),
+      'cardHovered=' + String(elementHovered(card)),
+      'thumbnailHovered=' + String(elementHovered(thumbnail)),
+      'pointerInsideOverlay=' + String(pointerInOverlay),
+      'pointerInsideCardGeometry=' + String(pointerInCard),
+      'pointerInsideThumbnailGeometry=' + String(pointerInThumbnail),
+      'activeCardSame=' + String(Boolean(lastHoveredCard && card && lastHoveredCard === card)),
+      'activeOuterSame=' + String(Boolean(outer && outer.isConnected && thumbnail && outer.parentNode === thumbnail)),
+      'activeInnerSame=' + String(Boolean(inner && inner.isConnected && outer && inner.parentNode === outer)),
+      'pendingCleanupPresent=' + String(Boolean(historyFallbackPendingCleanup && historyFallbackPendingCleanup.timer)),
+      'cleanupOwnerGeneration=' + String(historyFallbackPendingCleanup ? historyFallbackPendingCleanup.ownerGeneration : 'none'),
+      'reason=' + String(reason || 'fallback-ownership-ended')
+    ];
+
+    if (timerContext && typeof timerContext === 'object') {
+      if (timerContext.callbackGeneration != null) {
+        parts.push('callbackGeneration=' + String(timerContext.callbackGeneration));
+      }
+      parts.push('currentGeneration=' + String(timerContext.currentGeneration != null ? timerContext.currentGeneration : historyNativeFallbackGeneration));
+      if (timerContext.scheduledAt != null) {
+        parts.push('callbackAgeMs=' + String(Math.max(0, Math.round(Date.now() - timerContext.scheduledAt))));
+      }
+    }
+
+    console.debug('[YTPM][HistoryOwnershipEnd]', parts.join(' '));
+  }
+
+  function logHistoryOwnershipEndSchedule(generation, callbackGeneration, delayMs, trigger, session) {
+    const card = session && session.card;
+    const outer = session && (session.outer || document.querySelector('ytd-player#inline-player'));
+    const overlay = (session && session.overlay) || outer;
+    const point = session && session.lastPointer;
+    const pointerInOverlay = Boolean(isPointInsideElement(overlay, point) || elementHovered(overlay));
+    const sessionCurrent = Boolean(session && historyNativeFallbackSession === session);
+
+    const parts = [
+      'generation=' + String(generation != null ? generation : 'none'),
+      'callbackGeneration=' + String(callbackGeneration != null ? callbackGeneration : 'none'),
+      'delayMs=' + String(delayMs != null ? delayMs : 0),
+      'trigger=' + String(trigger || 'unknown'),
+      'cardHovered=' + String(elementHovered(card)),
+      'pointerInsideOverlay=' + String(pointerInOverlay),
+      'sessionStillCurrent=' + String(sessionCurrent)
+    ];
+
+    console.debug('[YTPM][HistoryOwnershipEndSchedule]', parts.join(' '));
+  }
+
+  function logHistoryOwnershipEndCancel(generation, callbackGeneration, cancelReason) {
+    const parts = [
+      'generation=' + String(generation != null ? generation : 'none'),
+      'callbackGeneration=' + String(callbackGeneration != null ? callbackGeneration : 'none'),
+      'cancelReason=' + String(cancelReason || 'cancelled')
+    ];
+
+    console.debug('[YTPM][HistoryOwnershipEndCancel]', parts.join(' '));
+  }
+
+  function scheduleHistoryOwnershipEnd(session, delayMs, trigger) {
+    cancelHistoryOwnershipEnd('rescheduled');
+    const generation = session ? session.generation : historyNativeFallbackGeneration;
+    const cleanup = {
+      ownerGeneration: generation,
+      scheduledAt: Date.now(),
+      delayMs: delayMs,
+      trigger: trigger || 'ownership-lost',
+      timer: window.setTimeout(function () {
+        if (historyFallbackPendingCleanup === cleanup) {
+          historyFallbackPendingCleanup = null;
+        }
+        if (historyNativeFallbackSession === session) {
+          logHistoryOwnershipEnd(session, 'fallback-ownership-ended', {
+            callbackGeneration: generation,
+            currentGeneration: historyNativeFallbackGeneration,
+            scheduledAt: cleanup.scheduledAt
+          });
+          cleanupHistoryNativeFallback('fallback-ownership-ended');
+        }
+      }, delayMs)
+    };
+    historyFallbackPendingCleanup = cleanup;
+    logHistoryOwnershipEndSchedule(generation, generation, delayMs, trigger, session);
+    return cleanup;
+  }
+
+  function cancelHistoryOwnershipEnd(reason) {
+    if (historyFallbackPendingCleanup && historyFallbackPendingCleanup.timer) {
+      window.clearTimeout(historyFallbackPendingCleanup.timer);
+      const ownerGen = historyFallbackPendingCleanup.ownerGeneration;
+      historyFallbackPendingCleanup = null;
+      logHistoryOwnershipEndCancel(historyNativeFallbackSession ? historyNativeFallbackSession.generation : ownerGen, ownerGen, reason || 'cancelled');
+    }
+  }
+
+  function logAdExposureFenceFailure(invariant, session, fields) {
+    if (!DEBUG_LOGGING || typeof console === 'undefined' || typeof console.debug !== 'function') return;
+    const elapsedMs = session && session.startedAt ? Math.max(0, Math.round(Date.now() - session.startedAt)) : 0;
+    const inner = session && session.outer && session.outer.querySelector('#inline-preview-player.html5-video-player');
+    const video = inner && inner.querySelector('video');
+    const adShowing = Boolean(inner && (inner.classList.contains('ad-showing') || inner.hasAttribute('ad-showing')));
+    const adInterrupting = Boolean(inner && (inner.classList.contains('ad-interrupting') || inner.hasAttribute('ad-interrupting')));
+    const fenceClosed = Boolean(session && session.fenceActive);
+    const gateClosed = Boolean(session && session.outer && session.outer.getAttribute('data-ytpm-presentation-closed') === 'true');
+    const parts = [
+      'generation=' + String(session ? session.generation : ''),
+      'phase=failure',
+      'invariant=' + String(invariant),
+      'elapsedMs=' + String(elapsedMs),
+      'fenceClosed=' + String(fenceClosed),
+      'presentationGateClosed=' + String(gateClosed),
+      'playerPresented=' + String(Boolean(session && session.active)),
+      'videoPresented=' + String(Boolean(video && video.isConnected)),
+      'adShowing=' + String(adShowing),
+      'adInterrupting=' + String(adInterrupting)
+    ];
+    if (fields) {
+      Object.keys(fields).forEach(function (k) {
+        parts.push(k + '=' + String(fields[k]));
+      });
+    }
+    console.debug('[YTPM][AdExposureFence]', parts.join(' '));
+  }
+
+  function activateHistoryPrePresentationFence(session) {
+    if (!session || session.fenceActive) return;
+    session.fenceActive = true;
+    session.fenceClosedAt = Date.now();
+    const thumbnailHost = session.card && findThumbnailHost(session.card);
+    if (thumbnailHost) {
+      session.thumbnailHost = thumbnailHost;
+      thumbnailHost.setAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE, 'true');
+    }
+    if (session.card && session.card.setAttribute) {
+      session.card.setAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE, 'true');
+    }
+    if (session.preview && session.preview.setAttribute) {
+      session.preview.setAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE, 'true');
+    }
+    if (session.outer && session.outer.setAttribute) {
+      session.outer.setAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE, 'true');
+    }
+  }
+
+  function releaseHistoryPrePresentationFence(session, reason) {
+    if (!session || !session.fenceActive) return;
+    if (reason === 'presentation-gate-authoritative') {
+      const gateClosed = Boolean(session.outer && session.outer.getAttribute('data-ytpm-presentation-closed') === 'true');
+      if (!gateClosed) {
+        logAdExposureFenceFailure('PRESENTATION_GATE_NOT_CLOSED_BEFORE_HANDOFF', session, { reason: reason });
+      }
+    }
+    session.fenceActive = false;
+    if (session.thumbnailHost && session.thumbnailHost.removeAttribute) {
+      session.thumbnailHost.removeAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE);
+    }
+    if (session.card && session.card.removeAttribute) {
+      session.card.removeAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE);
+    }
+    if (session.preview && session.preview.removeAttribute) {
+      session.preview.removeAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE);
+    }
+    if (session.outer && session.outer.removeAttribute) {
+      session.outer.removeAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE);
+    }
+  }
+
+  function cleanupHistoryNativeFallback(reason) {
+    const session = historyNativeFallbackSession;
+    if (!session) { return; }
+    releaseHistoryPrePresentationFence(session, reason || 'history-cleanup');
+    logHistoryOwnershipEnd(session, reason || 'history-cleanup');
+    cancelHistoryOwnershipEnd('session-cleanup');
+    disarmPreviewAdGuard(session, reason || 'history-cleanup');
+    disposeFreshLoadFence(session, reason || 'history-cleanup');
+    if (session.pollTimer) { window.clearTimeout(session.pollTimer); }
+    if (session.monitorTimer) { window.clearInterval(session.monitorTimer); }
+    if (session.mediaObserver) { session.mediaObserver.disconnect(); }
+    if (session.hoverPointerListener) { document.removeEventListener('pointermove', session.hoverPointerListener, true); }
+    if (session.outer && session.outer.isConnected && session.outer.parentNode === session.thumbnailHost && session.outerParent) {
+      session.outerParent.insertBefore(session.outer, session.outerNextSibling && session.outerNextSibling.parentNode === session.outerParent ? session.outerNextSibling : null);
+    }
+    if (session.outer) { session.outer.classList.remove(HISTORY_FALLBACK_CLASS); session.outer.style.cssText = session.outerStyle || ''; }
+    if (session.preview) { session.preview.classList.remove(HISTORY_FALLBACK_CLASS); }
+    if (session.card) { session.card.classList.remove(HISTORY_FALLBACK_CLASS); }
+    if (session.thumbnailHost) { session.thumbnailHost.classList.remove(HISTORY_FALLBACK_CLASS); }
+    logHistoryNativeFallback('historyNativeFallbackCleanup', { reason: reason || 'explicit', videoId: session.videoId, generation: session.generation });
+    historyNativeFallbackSession = null;
+    schedulePreviewSync();
+  }
+
+  function historyNativeFallbackState(session) {
+    const outer = session && session.outer;
+    const inner = outer && outer.querySelector('#inline-preview-player.html5-video-player');
+    const video = inner && inner.querySelector('video');
+    return {
+      videoId: session && session.videoId,
+      generation: session && session.generation,
+      cardConnected: Boolean(session && session.card && session.card.isConnected),
+      previewConnected: Boolean(session && session.preview && session.preview.isConnected),
+      innerConnected: Boolean(inner && inner.isConnected),
+      sourceScheme: video ? (/^blob:/i.test(video.currentSrc || video.src || '') ? 'blob:' : (video.currentSrc || video.src) ? 'other:' : 'empty') : 'empty',
+      readyState: video ? Number(video.readyState) : 0,
+      paused: video ? Boolean(video.paused) : true,
+      muted: video ? Boolean(video.muted) : null
+    };
+  }
+
+  function presentHistoryNativeFallback(session) {
+    const thumbnailHost = session.card && findThumbnailHost(session.card);
+    if (!thumbnailHost || !session.outer || !session.outer.isConnected) { return false; }
+    session.thumbnailHost = thumbnailHost;
+    session.outerParent = session.outer.parentNode;
+    session.outerNextSibling = session.outer.nextSibling;
+    session.outerStyle = session.outer.getAttribute('style') || '';
+    if (!document.getElementById('ytpm-history-native-fallback-style')) {
+      const style = document.createElement('style');
+      style.id = 'ytpm-history-native-fallback-style';
+      style.textContent = '.ytpm-history-native-fallback-active animated-thumbnail-overlay-view-model{visibility:hidden!important;pointer-events:none!important;}';
+      (document.head || document.documentElement).appendChild(style);
+    }
+    thumbnailHost.classList.add(HISTORY_FALLBACK_CLASS);
+    session.card.classList.add(HISTORY_FALLBACK_CLASS);
+    session.preview.classList.add(HISTORY_FALLBACK_CLASS);
+    session.outer.classList.add(HISTORY_FALLBACK_CLASS);
+    if (session.fenceActive) {
+      thumbnailHost.setAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE, 'true');
+      session.outer.setAttribute(HISTORY_PRE_PRESENTATION_FENCE_ATTRIBUTE, 'true');
+    }
+    thumbnailHost.appendChild(session.outer);
+    session.outer.style.position = 'absolute';
+    session.outer.style.inset = '0';
+    session.outer.style.width = '100%';
+    session.outer.style.height = '100%';
+    session.outer.style.zIndex = '2';
+    session.outer.style.pointerEvents = 'none';
+    if (!session.fenceActive) {
+      logAdExposureFenceFailure('FENCE_NOT_ACTIVE_BEFORE_PRESENT', session);
+    }
+    logHistoryNativeFallback('historyNativeFallbackPresented', historyNativeFallbackState(session));
+    return true;
+  }
+
+  function findHistoryFallbackCard(videoId) {
+    return Array.from(collectCards(document)).find(function (card) {
+      return getVideoIdFromKey(getCardVideoKey(card)) === videoId;
+    }) || null;
+  }
+
+  function requestHistoryNativeFallback(event, trigger) {
+    const videoId = event && event.detail && typeof event.detail.videoId === 'string' ? event.detail.videoId : '';
+    const capturedCard = event && event.detail && isElement(event.detail.card) ? event.detail.card : null;
+    const requestTrigger = trigger || 'debug-command';
+    logHistoryNativeFallback('historyNativeFallbackRequested', { videoId: String(videoId).slice(0, 32), trigger: requestTrigger });
+    logHistoryNativeFallback('historyNativeFallbackEntered', { pathname: window.location.pathname, requestedVideoId: String(videoId).slice(0, 32) });
+    try { return requestHistoryNativeFallbackInternal(videoId, requestTrigger, capturedCard); } catch (error) {
+      logHistoryNativeFallback('historyNativeFallbackFailed', { phase: historyNativeFallbackPhase, reason: 'internal-error', errorName: error && error.name || 'Error' });
+      cleanupHistoryNativeFallback('internal-error');
+      return { ok: false, reason: 'internal-error' };
+    }
+  }
+
+  function requestHistoryNativeFallbackInternal(videoId, trigger, capturedCard) {
+    historyNativeFallbackPhase = 'validate';
+    if (window.location.pathname !== '/feed/history') { logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'wrong-pathname' }); return; }
+    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) { logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'invalid-video-id' }); return; }
+    if (historyNativeFallbackSession) {
+      logHistoryOwnershipEnd(historyNativeFallbackSession, 'replaced');
+      cleanupHistoryNativeFallback('replaced');
+    }
+    const card = capturedCard || findHistoryFallbackCard(videoId);
+    const preview = document.querySelector('ytd-video-preview');
+    const outer = document.querySelector('ytd-player#inline-player');
+    if (preview && preview.hasAttribute('active') && isPreviewAssociatedWithCard(card, preview)) { logHistoryNativeFallback('historyNativeFallbackFailed', { reason: 'natural-preview-already-active', requestedVideoId: videoId }); return; }
+    const hovered = Boolean(card && (card.matches(':hover') || card.querySelector(':hover')));
+    const thumbnailHovered = isHistoryThumbnailHovered(card);
+    if (!card || !isElement(card) || !thumbnailHovered || !preview || !outer) {
+      logHistoryNativeFallback('historyNativeFallbackFailed', { phase: 'validate', reason: !card ? 'target-card-not-found' : !thumbnailHovered ? 'thumbnail-not-hovered' : !preview ? 'preview-not-found' : 'outer-player-not-found', requestedVideoId: videoId, cardHovered: hovered, thumbnailHovered: thumbnailHovered });
+      return;
+    }
+    const session = { videoId: videoId, card: card, preview: preview, outer: outer, startedAt: Date.now(), active: false, fenceActive: false, fenceClosedAt: 0, firstMediaActivityLogged: false, pollTimer: 0, generation: ++historyNativeFallbackGeneration, trigger: 'automatic-hover', surface: 'history-native-fallback', mediaStarted: false, adSessionId: '', adGuard: null, nativePreview: preview, nativePreviewPlayer: null, overlay: outer, video: null, isCurrent: function () { return historyNativeFallbackSession === session; } };
+    historyNativeFallbackSession = session;
+    activateHistoryPrePresentationFence(session);
+    session.hoverPointerListener = function (event) {
+      if (historyNativeFallbackSession === session && Number.isFinite(event.clientX) && Number.isFinite(event.clientY)) {
+        session.lastPointer = { x: Number(event.clientX), y: Number(event.clientY) };
+      }
+    };
+    document.addEventListener('pointermove', session.hoverPointerListener, { capture: true, passive: true });
+    historyNativeFallbackPhase = 'prepare';
+    logHistoryNativeFallback('historyNativeFallbackPreparing', { videoId: videoId, trigger: trigger, generation: session.generation });
+    const continueAfterPreparation = function () {
+      const deadline = Date.now() + 2200;
+      const waitForInner = function () {
+        if (historyNativeFallbackSession !== session || session.generation !== historyNativeFallbackGeneration) { return; }
+        const inner = outer.querySelector('#inline-preview-player.html5-video-player');
+        if (inner && inner.isConnected) {
+          session.inner = inner;
+          session.nativePreviewPlayer = inner;
+          session.video = inner.querySelector('video');
+          logHistoryNativeFallback('historyNativeFallbackPrepared', { videoId: videoId, generation: session.generation });
+          if (!presentHistoryNativeFallback(session)) { cleanupHistoryNativeFallback('presentation-unavailable'); return; }
+          session.active = true;
+          logHistoryNativeFallback('historyNativeFallbackOwned', { videoId: videoId, generation: session.generation });
+          if (typeof MutationObserver === 'function') {
+            session.mediaObserver = new MutationObserver(function () {
+              const media = session.outer.querySelector('#inline-preview-player video, #inline-preview-player.html5-video-player video');
+              if (media && historyNativeFallbackSession === session) {
+                media.muted = true;
+              }
+            });
+            session.mediaObserver.observe(session.outer, { childList: true, subtree: true });
+          }
+          armHistoryPreviewAdGuard(session);
+          if (session.adGuard && typeof session.adGuard.noteLoadRequested === 'function') {
+            session.adGuard.noteLoadRequested();
+          }
+          logHistoryNativeFallback('historyNativeFallbackLoadRequested', { videoId: videoId, generation: session.generation });
+          requestPageBridge('history-native-fallback-load', {
+            videoId: videoId,
+            generation: session.generation
+          }, 5000).then(function (result) {
+            if (historyNativeFallbackSession !== session) { return; }
+            logHistoryNativeFallback('historyNativeFallbackLoadBridgeResult', { videoId: videoId, generation: session.generation, ok: Boolean(result && result.ok), reason: result && result.reason || null, outerPresent: Boolean(result && result.outerPresent), innerPresent: Boolean(result && result.innerPresent), loadMethodPresent: Boolean(result && result.loadMethodPresent), loadInvoked: Boolean(result && result.loadInvoked), videoPresentBefore: Boolean(result && result.videoPresentBefore), videoPresentAfterImmediate: Boolean(result && result.videoPresentAfterImmediate), pausedAfterImmediate: result && typeof result.pausedAfterImmediate === 'boolean' ? result.pausedAfterImmediate : null, readyStateAfterImmediate: result && Number.isFinite(result.readyStateAfterImmediate) ? result.readyStateAfterImmediate : null });
+            if (result && result.invoked) {
+              logHistoryNativeFallback('historyNativeFallbackLoadInvoked', { videoId: videoId, generation: session.generation });
+              session.monitorTimer = window.setInterval(function () {
+                if (historyNativeFallbackSession !== session) { return; }
+                if (window.location.pathname !== '/feed/history' || !session.card.isConnected || lastHoveredCard !== session.card || !isHistoryFallbackInteractionValid(session)) {
+                  logHistoryOwnershipEnd(session, 'fallback-ownership-ended', {
+                    callbackGeneration: session.generation,
+                    currentGeneration: historyNativeFallbackGeneration,
+                    scheduledAt: session.startedAt
+                  });
+                  cleanupHistoryNativeFallback('fallback-ownership-ended');
+                  return;
+                }
+                const state = historyNativeFallbackState(session);
+                const media = session.outer.querySelector('#inline-preview-player video');
+                if (media) {
+                  media.muted = true;
+                }
+                if (!session.mediaStarted && state.sourceScheme !== 'empty' && state.paused === false) {
+                  session.mediaStarted = true;
+                  logHistoryNativeFallback('historyNativeFallbackMediaStarted', state);
+                }
+              }, 100);
+            } else {
+              logHistoryOwnershipEnd(session, 'load-not-invoked');
+              cleanupHistoryNativeFallback('load-not-invoked');
+              logHistoryNativeFallback('historyNativeFallbackFailed', { reason: result && result.reason || 'load-not-invoked' });
+            }
+          }).catch(function () {
+            if (historyNativeFallbackSession === session) {
+              logHistoryOwnershipEnd(session, 'load-bridge-rejected');
+              cleanupHistoryNativeFallback('load-bridge-rejected');
+            }
+          });
+          return;
+        }
+        if (Date.now() >= deadline) {
+          logHistoryOwnershipEnd(session, 'inner-player-not-prepared', {
+            callbackGeneration: session.generation,
+            currentGeneration: historyNativeFallbackGeneration,
+            scheduledAt: session.startedAt
+          });
+          cleanupHistoryNativeFallback('inner-player-not-prepared');
+          return;
+        }
+        session.pollTimer = window.setTimeout(waitForInner, 25);
+      };
+      waitForInner();
+    };
+    const existingInner = outer.querySelector('#inline-preview-player.html5-video-player');
+    const existingVideo = existingInner && existingInner.querySelector('video');
+    const existingCold = existingInner && existingInner.isConnected && !(existingInner.getAttribute('video-id') || existingInner.videoId) && (!existingVideo || !(existingVideo.currentSrc || existingVideo.src));
+    stopHistoryYtActionTargetMirror(globalThis.__ytpmHistoryTargetMirror, 'preparation-begin');
+    if (existingInner && !existingCold && trigger !== 'automatic-hover') { cleanupHistoryNativeFallback('inner-player-not-cold'); }
+    else if (existingInner) { continueAfterPreparation(); }
+    else { requestPageBridge('history-native-fallback-prepare', { videoId: videoId }, 2600).then(continueAfterPreparation).catch(function () { cleanupHistoryNativeFallback('prepare-bridge-rejected'); }); }
+  }
+
+  function disposeFreshLoadFence(session, reason) {
+    const fence = session && session.freshLoadFence;
+    if (!fence) {
+      return;
+    }
+    fence.dispose(reason || 'disposed');
+    session.freshLoadFence = null;
+  }
+
+  function createFreshLoadFence(session, surface) {
+    disposeFreshLoadFence(session, 'replaced');
+    const fence = {
+      evidence: false,
+      eventName: '',
+      evidenceVideo: null,
+      disposed: false,
+      observer: null,
+      innerCleanups: [],
+      inner: null,
+      video: null,
+      markLoadStarted: null,
+      hasEvidence: function () { return fence.evidence === true; },
+      getEventName: function () { return fence.eventName; },
+      getEvidenceVideo: function () { return fence.evidenceVideo; },
+      dispose: function (reason) {
+        if (fence.disposed) {
+          return;
+        }
+        fence.disposed = true;
+        if (fence.observer) {
+          fence.observer.disconnect();
+          fence.observer = null;
+        }
+        fence.innerCleanups.forEach(function (cleanup) { cleanup(); });
+        fence.innerCleanups = [];
+        forensicLog('ExplicitFreshLoadFence', 'explicitFreshLoadFenceDisposed', {
+          surface: surface,
+          generation: session.generation,
+          reason: reason || 'disposed'
+        });
+      }
+    };
+    session.freshLoadFence = fence;
+    const isCurrent = function () {
+      return typeof session.isCurrent === 'function' ? session.isCurrent() : true;
+    };
+    fence.markLoadStarted = function () {
+      if (fence.disposed) {
+        return;
+      }
+      session.loadRequestStarted = true;
+      session.loadStartedAt = Date.now();
+      forensicLog('ExplicitFreshLoadFence', 'explicitFreshLoadStarted', {
+        surface: surface,
+        generation: session.generation
+      });
+    };
+    const observeVideo = function (inner) {
+      if (!inner || !inner.isConnected || fence.disposed) {
+        return;
+      }
+      fence.innerCleanups.forEach(function (cleanup) { cleanup(); });
+      fence.innerCleanups = [];
+      if (fence.video && fence.video !== video) {
+        fence.evidence = false;
+        fence.eventName = '';
+        fence.evidenceVideo = null;
+      }
+      fence.inner = inner;
+      fence.video = inner.querySelector('video');
+      ['loadstart', 'emptied', 'loadedmetadata', 'canplay', 'playing'].forEach(function (eventName) {
+        const handler = function (event) {
+          const eventVideo = event.target && event.target.tagName === 'VIDEO' ? event.target : null;
+          if (!eventVideo || !session.loadRequestStarted || fence.evidence || fence.disposed || !isCurrent()) {
+            return;
+          }
+          fence.evidence = true;
+          fence.eventName = eventName;
+          fence.evidenceVideo = eventVideo;
+          fence.video = eventVideo;
+          if (typeof session.onFreshLoadEvidence === 'function') {
+            session.onFreshLoadEvidence(eventName, eventVideo);
+          }
+          forensicLog('ExplicitFreshLoadFence', 'explicitFreshLoadEvidence', {
+            surface: surface,
+            generation: session.generation,
+            eventName: eventName,
+            reason: 'post-load-lifecycle'
+          });
+        };
+        inner.addEventListener(eventName, handler, true);
+        fence.innerCleanups.push(function () { inner.removeEventListener(eventName, handler, true); });
+      });
+    };
+    const observeInner = function (inner) {
+      if (!inner || !inner.isConnected || fence.disposed) {
+        return;
+      }
+      if (fence.inner === inner && fence.innerCleanups.length && fence.video === inner.querySelector('video')) {
+        return;
+      }
+      observeVideo(inner);
+    };
+    const outer = session.outer && session.outer.isConnected
+      ? session.outer
+      : document.querySelector('ytd-player#inline-player');
+    observeInner(outer && outer.querySelector('#inline-preview-player.html5-video-player'));
+    if (outer && typeof MutationObserver === 'function') {
+      fence.observer = new MutationObserver(function () {
+        observeInner(outer.querySelector('#inline-preview-player.html5-video-player'));
+      });
+      fence.observer.observe(outer, { childList: true, subtree: true });
+    }
+    forensicLog('ExplicitFreshLoadFence', 'explicitFreshLoadFenceArmed', {
+      surface: surface,
+      generation: session.generation
+    });
+    return fence;
+  }
+
+  function queueHistoryNativeFallback(card) {
+    if (window.location.pathname !== '/feed/history') {
+      return;
+    }
+    if (historyNativeFallbackStartTimer) {
+      window.clearTimeout(historyNativeFallbackStartTimer);
+      logHistoryOwnershipEndCancel(historyNativeFallbackSession ? historyNativeFallbackSession.generation : 'none', historyNativeFallbackIntentGeneration, 'intent-rescheduled');
+    }
+    const videoId = getVideoIdFromKey(getCardVideoKey(card));
+    const intentGeneration = ++historyNativeFallbackIntentGeneration;
+    snapshotPreviewEligibilityState(card, 'history', intentGeneration);
+    startHistoryYtActionTargetMirror(card, getCardVideoKey(card), intentGeneration);
+    forensicLog('HistoryNativeFallback', 'historyNativeFallbackTargetScheduled', Object.assign({ requestedVideoId: videoId, scheduledCardPresent: Boolean(card), scheduledCardConnected: Boolean(card && card.isConnected), scheduledCardTagName: card ? card.tagName : '', scheduledCardClassName: card ? String(card.className || '').slice(0, 160) : '', scheduledCardHovered: Boolean(card && (card.matches(':hover') || card.querySelector(':hover'))), scheduledThumbnailHovered: isHistoryThumbnailHovered(card), timestamp: performance.now() }, getHistoryFallbackIdentityDiagnostics(videoId, card)));
+    logHistoryOwnershipEndSchedule(historyNativeFallbackSession ? historyNativeFallbackSession.generation : 'none', intentGeneration, 80, 'automatic-hover', historyNativeFallbackSession);
+    historyNativeFallbackStartTimer = window.setTimeout(function () {
+      historyNativeFallbackStartTimer = 0;
+      const stillHovered = Boolean(card && (card.matches(':hover') || card.querySelector(':hover')));
+      const stillThumbnailHovered = isHistoryThumbnailHovered(card);
+      if (lastHoveredCard === card && intentGeneration === historyNativeFallbackIntentGeneration && card.isConnected && getVideoIdFromKey(getCardVideoKey(card)) === videoId && stillThumbnailHovered && videoId) {
+        forensicLog('HistoryNativeFallback', 'historyNativeFallbackTargetValidated', Object.assign({ requestedVideoId: videoId, validatedSameObject: true, validatedCardConnected: true, validatedCardTagName: card.tagName, validatedCardClassName: String(card.className || '').slice(0, 160), validatedCardHovered: stillHovered, validatedThumbnailHovered: stillThumbnailHovered, timestamp: performance.now() }, getHistoryFallbackIdentityDiagnostics(videoId, card)));
+        requestHistoryNativeFallback({ detail: { videoId: videoId, card: card } }, 'automatic-hover');
+      } else if (videoId) {
+        forensicLog('HistoryNativeFallback', 'historyNativeFallbackTargetValidated', Object.assign({ requestedVideoId: videoId, validatedSameObject: false, validatedCardConnected: Boolean(card && card.isConnected), validatedCardTagName: card ? card.tagName : '', validatedCardClassName: card ? String(card.className || '').slice(0, 160) : '', validatedCardHovered: stillHovered, validatedThumbnailHovered: stillThumbnailHovered, timestamp: performance.now() }, getHistoryFallbackIdentityDiagnostics(videoId, card)));
+      }
+    }, 80);
+  }
+
+  function handleCardHoverExit(event) {
+    const target = isElement(event.target) ? event.target : null;
+    const card = target ? target.closest(CARD_SELECTOR) : null;
+    const related = isElement(event.relatedTarget) ? event.relatedTarget.closest(CARD_SELECTOR) : null;
+    if (!card || card !== lastHoveredCard) {
+      return;
+    }
+    if (window.location.pathname === '/feed/history') {
+      const thumbnailHost = findThumbnailHost(card);
+      const targetInThumbnail = Boolean(thumbnailHost && thumbnailHost.contains(event.target));
+      const relatedInThumbnail = Boolean(thumbnailHost && isElement(event.relatedTarget) && thumbnailHost.contains(event.relatedTarget));
+      if (!targetInThumbnail || relatedInThumbnail) {
+        return;
+      }
+    } else if (related === card) {
+      return;
+    }
+    cancelHistoryNativeFallbackIntent('card-hover-exit');
+    if (historyNativeFallbackSession && historyNativeFallbackSession.card === card) {
+      if (window.location.pathname === '/feed/history') {
+        const classification = logHistoryHoverLossCandidate(historyNativeFallbackSession);
+        if (classification === 'CARD_STILL_HOVERED' || classification === 'POINTER_INSIDE_OVERLAY' ||
+          classification === 'THUMBNAIL_REPLACED_SESSION_STILL_VALID' || classification === 'CANDIDATE_REPLACED_SESSION_STILL_VALID') {
+          return;
+        }
+      }
+      const exitReason = window.location.pathname === '/feed/history' ? 'thumbnail-no-longer-hovered' : 'target-card-no-longer-hovered';
+      logHistoryOwnershipEnd(historyNativeFallbackSession, exitReason);
+      cleanupHistoryNativeFallback(exitReason);
+    }
+    if (window.location.pathname === '/feed/history') {
+      lastHoveredCard = null;
+    }
+    if (homeYtActionProvenanceSession && homeYtActionProvenanceSession.card === card) {
+      verifyHomeYtActionProvenanceHover(homeYtActionProvenanceSession);
+    }
+    verifyHomeYtActionTargetLifecycleHover(globalThis.__ytpmHomeTargetLifecycle);
   }
 
   function isOverlayMediaConnected(state) {
@@ -1671,6 +2957,11 @@
     captionViewport.appendChild(captionIncoming);
     captions.appendChild(captionViewport);
 
+    const adShield = document.createElement('div');
+    adShield.className = 'ytpm-overlay__ad-shield';
+    adShield.setAttribute('aria-hidden', 'true');
+    adShield.textContent = 'Preparing preview…';
+
     const qualityWrap = document.createElement('span');
     qualityWrap.className = QUALITY_CLASS;
 
@@ -1709,6 +3000,7 @@
 
     overlay.appendChild(frame);
     frame.appendChild(closeButton);
+    frame.appendChild(adShield);
     frame.appendChild(captions);
     frame.appendChild(timelinePreview);
     frame.appendChild(seekInput);
@@ -1718,6 +3010,7 @@
       overlay: overlay,
       closeButton: closeButton,
       frame: frame,
+      adShield: adShield,
       controls: {
         root: controls,
         leftControls: leftControls,
@@ -1880,6 +3173,240 @@
     return candidates.find(function (candidate) {
       return candidate.id === 'inline-preview-player' && isVisible(candidate);
     }) || candidates.find(isVisible) || candidates[0] || null;
+  }
+
+  function isCurrentPreviewAdSession(state) {
+    if (!state || activeOverlay !== state || !state.card.isConnected ||
+      !state.overlay.isConnected || !state.video.isConnected ||
+      !state.nativePreview || !state.nativePreview.isConnected) {
+      return false;
+    }
+
+    const liveCardVideoId = getVideoIdFromKey(getCardVideoKey(state.card));
+    return (!liveCardVideoId || liveCardVideoId === state.videoId) &&
+      state.nativePreview.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) ===
+      state.adSessionId && state.nativePreview.getAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE) ===
+      state.videoId;
+  }
+
+  function clearPreviewAdOwnership(state) {
+    if (!state) {
+      return;
+    }
+
+    const player = state.nativePreviewPlayer;
+    if (state.nativePreview && state.nativePreview.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) ===
+      state.adSessionId) {
+      state.nativePreview.removeAttribute(PREVIEW_AD_SESSION_ATTRIBUTE);
+      state.nativePreview.removeAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE);
+    }
+    if (player && player.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) === state.adSessionId) {
+      player.removeAttribute(PREVIEW_AD_SESSION_ATTRIBUTE);
+      player.removeAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE);
+    }
+  }
+
+  function armPreviewAdGuard(state) {
+    logAdGuardLifecycle('arm-request', state);
+    if (!previewAdGuardFactory) {
+      logAdGuardLifecycle('arm-rejected', state, 'guard-api-unavailable');
+      return;
+    }
+    if (activeOverlay !== state) {
+      logAdGuardLifecycle('arm-rejected', state, 'no-active-overlay');
+      return;
+    }
+    if (!state.card || !state.card.isConnected) {
+      logAdGuardLifecycle('arm-rejected', state, 'no-card');
+      return;
+    }
+    if (!state.videoId) {
+      logAdGuardLifecycle('arm-rejected', state, 'no-video-id');
+      return;
+    }
+    if (!state.nativePreview) {
+      logAdGuardLifecycle('arm-rejected', state, 'no-preview');
+      return;
+    }
+    if (!state.nativePreview.isConnected) {
+      logAdGuardLifecycle('arm-rejected', state, 'preview-disconnected');
+      return;
+    }
+    if (!state.video || !state.video.isConnected) {
+      logAdGuardLifecycle('arm-rejected', state, 'no-media');
+      return;
+    }
+
+    const player = getNativePreviewPlayer(state.nativePreview);
+    if (!player || !player.isConnected) {
+      logAdGuardLifecycle('arm-rejected', state, 'no-inner-player');
+      return;
+    }
+
+    state.nativePreviewPlayer = player;
+    state.nativePreview.setAttribute(PREVIEW_AD_SESSION_ATTRIBUTE, state.adSessionId);
+    state.nativePreview.setAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE, state.videoId);
+    player.setAttribute(PREVIEW_AD_SESSION_ATTRIBUTE, state.adSessionId);
+    player.setAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE, state.videoId);
+    state.adGuard = previewAdGuardFactory.create({
+      generation: state.generation,
+      sessionId: state.adSessionId,
+      videoId: state.videoId,
+      media: state.video,
+      overlay: state.overlay,
+      isCurrent: function () {
+        return isCurrentPreviewAdSession(state);
+      },
+      getPlayer: function () {
+        const livePlayer = getNativePreviewPlayer(state.nativePreview);
+        return livePlayer && livePlayer.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) ===
+          state.adSessionId ? livePlayer : null;
+      },
+      getRecoveryContext: function () {
+        const inner = getNativePreviewPlayer(state.nativePreview);
+        return {
+          sessionCurrent: isCurrentPreviewAdSession(state),
+          generationCurrent: state.generation === previewAttemptId,
+          hoverValid: lastHoveredCard === state.card,
+          preview: state.nativePreview,
+          outer: findComposedAncestor(inner, 'ytd-player#inline-player') || inner,
+          inner: inner,
+          ownershipValid: Boolean(inner &&
+            inner.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) === state.adSessionId),
+          requestedVideoIdMatches: getVideoIdFromKey(getCardVideoKey(state.card)) === state.videoId
+        };
+      },
+      status: function () {
+        return requestPageBridge('preview-ad-status', {
+          videoId: state.videoId,
+          sessionId: state.adSessionId
+        });
+      },
+    });
+    if (!state.adGuard.arm()) {
+      logAdGuardLifecycle('arm-rejected', state, 'session-mismatch');
+    }
+  }
+
+  function armHistoryPreviewAdGuard(session) {
+    logAdGuardLifecycle('arm-request', session);
+    if (!previewAdGuardFactory) {
+      logAdGuardLifecycle('arm-rejected', session, 'guard-api-unavailable');
+      return;
+    }
+    if (historyNativeFallbackSession !== session || !session.active) {
+      logAdGuardLifecycle('arm-rejected', session, 'stale-generation');
+      return;
+    }
+    if (!session.card || !session.card.isConnected) {
+      logAdGuardLifecycle('arm-rejected', session, 'no-card');
+      return;
+    }
+    if (!session.videoId) {
+      logAdGuardLifecycle('arm-rejected', session, 'no-video-id');
+      return;
+    }
+    if (!session.nativePreview) {
+      logAdGuardLifecycle('arm-rejected', session, 'no-preview');
+      return;
+    }
+    if (!session.nativePreview.isConnected) {
+      logAdGuardLifecycle('arm-rejected', session, 'preview-disconnected');
+      return;
+    }
+    if (!session.outer || !session.outer.isConnected) {
+      logAdGuardLifecycle('arm-rejected', session, 'no-outer-player');
+      return;
+    }
+    if (!session.inner || !session.inner.isConnected) {
+      logAdGuardLifecycle('arm-rejected', session, 'no-inner-player');
+      return;
+    }
+    session.adSessionId = createBridgeNonce();
+    session.nativePreview.setAttribute(PREVIEW_AD_SESSION_ATTRIBUTE, session.adSessionId);
+    session.nativePreview.setAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE, session.videoId);
+    session.inner.setAttribute(PREVIEW_AD_SESSION_ATTRIBUTE, session.adSessionId);
+    session.inner.setAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE, session.videoId);
+    session.adGuard = previewAdGuardFactory.create({
+      generation: session.generation,
+      sessionId: session.adSessionId,
+      surface: session.surface,
+      videoId: session.videoId,
+      media: session.video,
+      getMedia: function () {
+        const liveMedia = session.inner && session.inner.querySelector('video');
+        session.video = liveMedia || null;
+        return liveMedia;
+      },
+      overlay: session.outer,
+      isCurrent: function () {
+        return historyNativeFallbackSession === session && session.active &&
+          session.card.isConnected && session.nativePreview.isConnected &&
+          session.inner.isConnected &&
+          session.nativePreview.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) === session.adSessionId;
+      },
+      getPlayer: function () {
+        return session.inner.isConnected &&
+          session.inner.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) === session.adSessionId
+          ? session.inner
+          : null;
+      },
+      getRecoveryContext: function () {
+        const liveInner = session.outer && session.outer.querySelector(
+          '#inline-preview-player.html5-video-player'
+        );
+        return {
+          sessionCurrent: historyNativeFallbackSession === session && session.active,
+          generationCurrent: session.generation === historyNativeFallbackGeneration,
+          hoverValid: lastHoveredCard === session.card && isHistoryThumbnailHovered(session.card),
+          card: session.card,
+          thumbnailHost: session.thumbnailHost || findThumbnailHost(session.card),
+          preview: session.nativePreview,
+          outer: session.outer,
+          inner: liveInner,
+          ownershipValid: session.nativePreview.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) ===
+            session.adSessionId && liveInner && liveInner.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) ===
+              session.adSessionId,
+          requestedVideoIdMatches: getVideoIdFromKey(getCardVideoKey(session.card)) === session.videoId
+        };
+      },
+      status: function () {
+        return requestPageBridge('preview-ad-status', {
+          videoId: session.videoId,
+          sessionId: session.adSessionId
+        });
+      },
+      holdBreakProbeEnabled: true,
+      holdBreakProbe: function () {
+        return requestPageBridge('history-ad-hold-break-load', { videoId: session.videoId, sessionId: session.adSessionId }, 1800);
+      },
+      contentReadyRecoveryEnabled: true,
+      contentReadyRecovery: function () {
+        return requestPageBridge('history-ad-hold-break-load', { videoId: session.videoId, sessionId: session.adSessionId }, 1800);
+      },
+    });
+    if (session.adGuard && session.adGuard.arm()) {
+      const gateAuthoritative = Boolean(
+        session.outer &&
+        session.outer.getAttribute('data-ytpm-preview-owned') === 'true' &&
+        session.outer.getAttribute('data-ytpm-presentation-closed') === 'true' &&
+        session.outer.getAttribute('data-ytpm-presentation-session') === session.adSessionId
+      );
+      if (gateAuthoritative) {
+        releaseHistoryPrePresentationFence(session, 'presentation-gate-authoritative');
+      }
+    } else {
+      logAdGuardLifecycle('arm-rejected', session, 'session-mismatch');
+      cleanupHistoryNativeFallback('arm-rejected');
+    }
+  }
+
+  function disarmPreviewAdGuard(state, reason) {
+    if (state && state.adGuard) {
+      state.adGuard.disarm(reason || 'session-ended');
+      state.adGuard = null;
+    }
+    clearPreviewAdOwnership(state);
   }
 
   function getNativeCaptionControl(preview, player) {
@@ -3001,6 +4528,59 @@
     });
   }
 
+  function getCaptionLifecycleDetails(state, nativeText) {
+    const renderer = state.nativeCaptionRenderer;
+    const windows = getCaptionWindows(renderer);
+    return {
+      generation: state.captionGeneration,
+      videoCurrentTime: readVideoCurrentTime(state),
+      authoritativeCaption: state.captionCommittedText || '',
+      visibleOverlayCaption: state.captionVisualText || '',
+      renderedDomText: state.controls.captions.textContent || '',
+      nativeExtractedText: nativeText || state.nativeCaptionText || '',
+      previewToken: state.captionPreviewToken,
+      animationToken: state.captionTransitionToken,
+      nativeWindowCount: windows.length,
+      activeNativeWindowDebugIds: Array.from(state.captionActiveWindows || [])
+        .filter(function (captionWindow) {
+          return windows.includes(captionWindow);
+        })
+        .map(getCaptionWindowDebugId)
+    };
+  }
+
+  function logCaptionTransitionForensics(state, event, transition, reason) {
+    const details = Object.assign(getCaptionLifecycleDetails(state, transition.nativeCandidate), {
+      committedParagraph: transition.currentText,
+      incomingParagraph: transition.incomingText,
+      transitionToken: transition.token,
+      previewOnly: transition.previewOnly === true,
+      reason: reason
+    });
+    debugLog('Captions', event, details);
+    forensicLog('CaptionForensics', event, details);
+  }
+
+  function logFirstNonEmptyCaptionWriteAfterClear(state, previousVisualText, newVisualText, nativeText) {
+    const lastClear = state.captionLastVisualClear;
+    if (!lastClear || !newVisualText) {
+      return;
+    }
+    const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+    forensicLog('CaptionForensics', 'firstNonEmptyCaptionWriteAfterClear', Object.assign(
+      getCaptionLifecycleDetails(state, nativeText),
+      {
+        previousVisualText: previousVisualText || '',
+        visualTextBeforeClear: lastClear.visualTextBeforeClear || '',
+        newVisualText: newVisualText,
+        deltaMsFromLastClear: now - lastClear.timestamp
+      }
+    ));
+    state.captionLastVisualClear = null;
+  }
+
   function getTransientCaptionEmptyPlan(state, renderer, requestedText) {
     if (!renderer || !renderer.isConnected || !state.captionVisualText ||
       !captionUtils.getTransientCaptionEmptyPlan) {
@@ -3053,6 +4633,7 @@
   }
 
   function commitMirroredCaptionText(state, text, options) {
+    const previousVisualText = state.captionVisualText || '';
     const nativeEmpty = !text;
     const canSuppressTransientEmpty = nativeEmpty && options &&
       options.allowTransientEmptySuppression === true;
@@ -3080,6 +4661,14 @@
     if (nativeEmpty) {
       logCaptionVisualClear(state, 'Applied', 'native-empty', text);
       logCaptionPaintForensics(state, 'after-native-empty-clear', text);
+      state.captionLastVisualClear = {
+        timestamp: typeof performance !== 'undefined' && typeof performance.now === 'function'
+          ? performance.now()
+          : Date.now(),
+        visualTextBeforeClear: previousVisualText
+      };
+    } else {
+      logFirstNonEmptyCaptionWriteAfterClear(state, previousVisualText, text, text);
     }
     return true;
   }
@@ -3147,13 +4736,10 @@
     state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--incoming-ready');
     state.captionTransition = null;
     state.captionTransitionToken += 1;
-    debugLog('Captions', 'captionTransitionCancelled', {
-      committedParagraph: transition.currentText,
-      nativeCandidate: transition.nativeCandidate,
-      incomingParagraph: transition.incomingText,
-      transitionToken: transition.token,
-      reason: reason
-    });
+    logCaptionTransitionForensics(state, 'captionTransitionCancelled', transition, reason);
+    if (transition.previewOnly) {
+      logCaptionTransitionForensics(state, 'rollupVisualPreviewCancelled', transition, reason);
+    }
   }
 
   function completeCaptionTransition(state, transition, reason) {
@@ -3177,13 +4763,7 @@
     state.captionVisualText = transition.incomingText;
     state.captionIncomingText = '';
     state.captionTransition = null;
-    debugLog('Captions', 'captionTransitionCompleted', {
-      committedParagraph: state.captionCommittedText,
-      nativeCandidate: transition.nativeCandidate,
-      incomingParagraph: '',
-      transitionToken: transition.token,
-      reason: reason
-    });
+    logCaptionTransitionForensics(state, 'captionTransitionCompleted', transition, reason);
   }
 
   function startCaptionTransition(state, currentText, incomingText, nativeCandidate, reason, previewOnly) {
@@ -3219,6 +4799,12 @@
     state.controls.captionCurrent.textContent = '';
     state.controls.captionIncoming.textContent = renderPlan.visibleText;
     state.controls.captions.hidden = false;
+    logFirstNonEmptyCaptionWriteAfterClear(
+      state,
+      currentText,
+      renderPlan.visibleText,
+      nativeCandidate
+    );
     const transitionHeight = Math.max(
       state.controls.captionIncoming.offsetHeight
     );
@@ -3238,14 +4824,10 @@
       state.controls.captionViewport.classList.remove('ytpm-overlay__caption-viewport--incoming-ready');
       state.controls.captionViewport.classList.add('ytpm-overlay__caption-viewport--rolling');
     });
-    debugLog('Captions', 'captionTransitionStarted', {
-      committedParagraph: currentText,
-      nativeCandidate: nativeCandidate,
-      incomingParagraph: incomingText,
-      transitionToken: token,
-      reason: reason,
-      rollup: true
-    });
+    logCaptionTransitionForensics(state, 'captionTransitionStarted', transition, reason);
+    if (transition.previewOnly) {
+      logCaptionTransitionForensics(state, 'rollupVisualPreviewStarted', transition, reason);
+    }
     state.captionTransitionTimer = window.setTimeout(function () {
       completeCaptionTransition(state, transition, 'animation-fallback');
     }, CAPTION_TRANSITION_DURATION_MS + 80);
@@ -3340,23 +4922,102 @@
     return state.rollupAtomicContext;
   }
 
-  function scheduleRollupVisualPreview(state, rawRollupText) {
+  function getRollupVisualPreviewEntryEvidence(renderer, expectedText) {
+    const physicalWindows = getCaptionWindows(renderer).filter(function (captionWindow) {
+      return isRollupCaptionWindow(captionWindow);
+    });
+    const expected = captionUtils.normalizeCaptionLines
+      ? captionUtils.normalizeCaptionLines(expectedText)
+      : String(expectedText || '').trim();
+    let matchingNativeLine = '';
+    let geometryEntryEvidence = null;
+
+    physicalWindows.some(function (captionWindow) {
+      const candidates = getCaptionSegmentNodes(captionWindow)
+        .concat(getCaptionLineContainers(captionWindow));
+      return candidates.some(function (candidate) {
+        const candidateText = captionUtils.normalizeCaptionLines
+          ? captionUtils.normalizeCaptionLines(candidate.textContent || '')
+          : String(candidate.textContent || '').trim();
+        if (!candidate.isConnected || candidateText !== expected ||
+          !isVisibleCaptionNode(candidate)) {
+          return false;
+        }
+        const entryPlan = captionUtils.getCaptionGeometryEntryPlan
+          ? captionUtils.getCaptionGeometryEntryPlan(
+            candidate.getBoundingClientRect(),
+            getCaptionEffectiveClipRect(captionWindow, renderer)
+          )
+          : { hasGeometryEntry: false, visibleHeightRatio: 0, visibleRect: null };
+        if (!entryPlan.hasGeometryEntry) {
+          return false;
+        }
+        matchingNativeLine = candidateText;
+        geometryEntryEvidence = entryPlan;
+        return true;
+      });
+    });
+
+    return {
+      matchingNativeLine: matchingNativeLine,
+      physicalWindowCount: physicalWindows.length,
+      geometryEntryEvidence: geometryEntryEvidence || {
+        hasGeometryEntry: false,
+        visibleHeightRatio: 0,
+        visibleRect: null
+      },
+      hasRollupMotion: physicalWindows.length > 0
+    };
+  }
+
+  function logRollupVisualPreviewForensics(state, event, context, rawRollupText, details) {
+    const previewDetails = details || {};
+    const payload = {
+      generation: state.captionGeneration,
+      videoCurrentTime: readVideoCurrentTime(state),
+      authoritativeCaption: state.captionCommittedText || '',
+      visibleOverlayCaption: state.captionVisualText || '',
+      predecessorLines: context.predecessorLines,
+      expectedSuccessorLines: context.expectedSuccessorLines,
+      rawRollupLines: getCaptionLineList(rawRollupText),
+      expectedSuccessorLineCount: context.expectedSuccessorLines.length,
+      matchingNativeLine: previewDetails.matchingNativeLine || '',
+      physicalWindowCount: previewDetails.physicalWindowCount || 0,
+      geometryEntryEvidence: previewDetails.geometryEntryEvidence || null,
+      movedUpward: previewDetails.movedUpward === true,
+      previewToken: previewDetails.previewToken || 0,
+      decisionReason: previewDetails.decisionReason || ''
+    };
+    debugLog('Captions', event, payload);
+    forensicLog('CaptionForensics', event, payload);
+  }
+
+  function scheduleRollupVisualPreview(state, rawRollupText, renderer, movedUpward) {
     const context = state.rollupAtomicContext;
-    if (!context || state.captionVisualText === context.expectedSuccessorLines.join('\n')) {
+    if (!context) {
+      return;
+    }
+    if (state.captionVisualText === context.expectedSuccessorLines.join('\n')) {
+      logRollupVisualPreviewForensics(state, 'rollupVisualPreviewRejected', context, rawRollupText, {
+        movedUpward: movedUpward,
+        previewToken: state.captionPreviewToken,
+        decisionReason: 'already-authoritative'
+      });
       return;
     }
     const token = ++state.captionPreviewToken;
     const expectedText = context.expectedSuccessorLines.join('\n');
-    debugLog('Captions', 'rollupVisualPreviewScheduled', {
-      authoritativeCaption: state.captionCommittedText,
-      visualCaption: state.captionVisualText,
-      predecessorLines: context.predecessorLines,
-      expectedSuccessorLines: context.expectedSuccessorLines,
+    logRollupVisualPreviewForensics(state, 'rollupVisualPreviewScheduled', context, rawRollupText, {
+      movedUpward: movedUpward,
       previewToken: token,
-      generation: state.captionGeneration,
-      reason: 'verified-raw-successor'
+      decisionReason: 'scheduled-for-structural-validation'
     });
     if (state.captionPreviewRaf) {
+      logRollupVisualPreviewForensics(state, 'rollupVisualPreviewCancelled', context, rawRollupText, {
+        movedUpward: movedUpward,
+        previewToken: token - 1,
+        decisionReason: 'superseded-before-preview-write'
+      });
       window.cancelAnimationFrame(state.captionPreviewRaf);
     }
     state.captionPreviewRaf = window.requestAnimationFrame(function () {
@@ -3365,8 +5026,46 @@
       if (activeOverlay !== state || token !== state.captionPreviewToken || !latest ||
         latest.predecessorText !== context.predecessorText ||
         latest.expectedSuccessorLines.join('\n') !== expectedText) {
+        logRollupVisualPreviewForensics(state, 'rollupVisualPreviewRejected', context, rawRollupText, {
+          movedUpward: movedUpward,
+          previewToken: token,
+          decisionReason: 'stale-preview-token'
+        });
         return;
       }
+      const entryEvidence = getRollupVisualPreviewEntryEvidence(renderer, expectedText);
+      const previewPlan = captionUtils.getRollupVisualPreviewPlan
+        ? captionUtils.getRollupVisualPreviewPlan(
+          latest.expectedSuccessorLines,
+          entryEvidence.geometryEntryEvidence,
+          movedUpward || entryEvidence.hasRollupMotion
+        )
+        : { shouldStart: true, reason: 'multiline-existing-preview-policy' };
+      const previewForensics = {
+        matchingNativeLine: entryEvidence.matchingNativeLine,
+        physicalWindowCount: entryEvidence.physicalWindowCount,
+        geometryEntryEvidence: entryEvidence.geometryEntryEvidence,
+        movedUpward: movedUpward,
+        previewToken: token,
+        decisionReason: previewPlan.reason
+      };
+      if (!previewPlan.shouldStart) {
+        logRollupVisualPreviewForensics(
+          state,
+          'rollupVisualPreviewRejected',
+          latest,
+          rawRollupText,
+          previewForensics
+        );
+        return;
+      }
+      logRollupVisualPreviewForensics(
+        state,
+        'rollupVisualPreviewAllowed',
+        latest,
+        rawRollupText,
+        previewForensics
+      );
       startCaptionTransition(
         state,
         state.captionCommittedText,
@@ -3375,15 +5074,6 @@
         'rollup-visual-preview',
         true
       );
-      debugLog('Captions', 'rollupVisualPreviewStarted', {
-        authoritativeCaption: state.captionCommittedText,
-        visualCaption: expectedText,
-        predecessorLines: latest.predecessorLines,
-        expectedSuccessorLines: latest.expectedSuccessorLines,
-        previewToken: token,
-        generation: state.captionGeneration,
-        reason: 'one-frame-structural-validation'
-      });
     });
   }
 
@@ -3448,7 +5138,7 @@
       ? updateRollupAtomicContext(state, previousText, rawRollupText)
       : null;
     if (atomicContext) {
-      scheduleRollupVisualPreview(state, rawRollupText);
+      scheduleRollupVisualPreview(state, rawRollupText, info.renderer, movedUpward);
       const candidateIsCompleteSuccessor = captionUtils.isExactCaptionLineSequence &&
         captionUtils.isExactCaptionLineSequence(text, atomicContext.expectedSuccessorLines);
       const candidateIsPartialPredecessor = captionUtils.isCaptionLineFragment &&
@@ -3489,13 +5179,22 @@
           state.nativeCaptionText = text;
           state.captionCommittedText = text;
           state.captionPreviousText = previousText;
-          debugLog('Captions', 'rollupVisualPreviewReconciled', {
+          const previewReconciledDetails = {
             authoritativeCaption: text,
             visualCaption: text,
             previewToken: state.captionPreviewToken,
             generation: state.captionGeneration,
             reason: 'authoritative-successor-matches-preview'
-          });
+          };
+          debugLog('Captions', 'rollupVisualPreviewReconciled', previewReconciledDetails);
+          forensicLog(
+            'CaptionForensics',
+            'rollupVisualPreviewReconciled',
+            Object.assign(
+              getCaptionLifecycleDetails(state, text),
+              previewReconciledDetails
+            )
+          );
           return info;
         }
       }
@@ -3610,6 +5309,7 @@
     state.captionWindowGenerations = new Map();
     state.captionLastMutationDebug = null;
     state.captionLastForensicSnapshot = null;
+    state.captionLastVisualClear = null;
     if (state.controls && state.controls.captions) {
       state.controls.captionCurrent.textContent = '';
       state.controls.captionIncoming.textContent = '';
@@ -3878,16 +5578,29 @@
     };
   }
 
-  function debugStoryboardMetadata(state, storyboard) {
-    const format = storyboard && Array.isArray(storyboard.formats)
-      ? storyboard.formats.find(function (candidate) {
-        return candidate.level === storyboard.recommendedLevel;
-      }) || storyboard.formats[0]
-      : null;
+  function logStoryboardForensics(state, event, details, mappingKey) {
+    debugLog('Storyboard', event, details);
+    if (event === 'frameMapped' && mappingKey) {
+      if (state.timelineLastForensicFrameKey === mappingKey) {
+        return;
+      }
+      state.timelineLastForensicFrameKey = mappingKey;
+    }
+    forensicLog('StoryboardForensics', event, details);
+  }
 
-    debugLog('Storyboard', 'metadata', {
+  function debugStoryboardMetadata(state, storyboard) {
+    const duration = state.duration || (storyboard && storyboard.duration) || 0;
+    const temporalDiagnostics = captionUtils.getStoryboardTemporalDiagnostics
+      ? captionUtils.getStoryboardTemporalDiagnostics(storyboard, 0, duration)
+      : null;
+    const format = temporalDiagnostics && temporalDiagnostics.formats.find(function (candidate) {
+      return candidate.isRecommended;
+    }) || null;
+
+    logStoryboardForensics(state, 'metadata', {
       videoId: state.videoId,
-      duration: state.duration || (storyboard && storyboard.duration) || 0,
+      duration: duration,
       storyboardSpecFound: Boolean(storyboard),
       storyboardLevel: format ? format.level : null,
       frameCount: format ? format.count : 0,
@@ -3896,7 +5609,12 @@
       framesPerSprite: format ? format.framesPerSprite : 0,
       spriteCount: format ? format.spriteCount : 0,
       storyboardUrl: format ? getDebugUrl(storyboard.template) : '',
-      templateUrl: format ? getDebugUrl(storyboard.template) : ''
+      templateUrl: format ? getDebugUrl(storyboard.template) : '',
+      formats: temporalDiagnostics ? temporalDiagnostics.formats.map(function (candidate) {
+        return Object.assign({}, candidate, {
+          selected: candidate.isRecommended === true
+        });
+      }) : []
     });
   }
 
@@ -4466,7 +6184,7 @@
   }
 
   function logStaleTimelineFrame(state, frame, position, token, displayedUrl, reason) {
-    debugLog('Storyboard', 'frameIgnored', {
+    logStoryboardForensics(state, 'frameIgnored', {
       token: token,
       timestamp: position.seconds,
       videoId: state.videoId,
@@ -4506,7 +6224,7 @@
     image.style.transform = 'translate(-' + frame.x + 'px, -' + frame.y + 'px)';
     state.controls.timelineTime.textContent = formatTime(position.seconds);
     preview.hidden = false;
-    debugLog('Storyboard', 'frameApplied', {
+    logStoryboardForensics(state, 'frameApplied', {
       token: token,
       timestamp: position.seconds,
       videoId: state.videoId,
@@ -4536,7 +6254,7 @@
     const displayedUrl = getTimelineImageUrl(image);
     const sameSpriteReady = state.timelineDisplayedUrl === requestedUrl &&
       displayedUrl === requestedUrl && image.complete && image.naturalWidth > 0;
-    debugLog('Storyboard', 'frameRequested', {
+    logStoryboardForensics(state, 'frameRequested', {
       token: token,
       timestamp: position.seconds,
       videoId: state.videoId,
@@ -4559,7 +6277,7 @@
 
     state.controls.timelinePreview.hidden = true;
     if (typeof Image !== 'function') {
-      debugLog('Storyboard', 'frameFailed', {
+      logStoryboardForensics(state, 'frameFailed', {
         token: token,
         timestamp: position.seconds,
         videoId: state.videoId,
@@ -4590,7 +6308,7 @@
 
       const loaderUrl = getTimelineImageUrl(loader);
       if (!loader.complete || loader.naturalWidth <= 0 || loaderUrl !== requestedUrl) {
-        debugLog('Storyboard', 'frameIgnored', {
+        logStoryboardForensics(state, 'frameIgnored', {
           token: token,
           timestamp: position.seconds,
           requestedUrl: getDebugUrl(requestedUrl),
@@ -4617,7 +6335,7 @@
     };
 
     loader.onload = function () {
-      debugLog('Storyboard', 'loadCompleted', {
+      logStoryboardForensics(state, 'loadCompleted', {
         token: token,
         timestamp: position.seconds,
         requestedUrl: getDebugUrl(requestedUrl),
@@ -4632,7 +6350,7 @@
       }
       settled = true;
       reportError('timeline-preview-image', error);
-      debugLog('Storyboard', 'frameFailed', {
+      logStoryboardForensics(state, 'frameFailed', {
         token: token,
         timestamp: position.seconds,
         videoId: state.videoId,
@@ -4648,7 +6366,7 @@
         loadCompleted: false
       });
     };
-    debugLog('Storyboard', 'loadStarted', {
+    logStoryboardForensics(state, 'loadStarted', {
       token: token,
       timestamp: position.seconds,
       requestedUrl: getDebugUrl(requestedUrl),
@@ -4678,7 +6396,14 @@
     }
 
     state.timelineDesiredUrl = frame.url;
-    debugLog('Storyboard', 'frameMapped', {
+    const temporalDiagnostics = captionUtils.getStoryboardTemporalDiagnostics
+      ? captionUtils.getStoryboardTemporalDiagnostics(
+        storyboard,
+        position.seconds,
+        getPreviewDuration(state)
+      )
+      : null;
+    const mappedDetails = {
       token: token,
       timestamp: position.seconds,
       videoId: state.videoId,
@@ -4689,8 +6414,25 @@
       cellIndex: frame.cellIndex,
       x: frame.x,
       y: frame.y,
-      requestedUrl: getDebugUrl(frame.url)
-    });
+      requestedUrl: getDebugUrl(frame.url),
+      requestedSeconds: position.seconds,
+      normalizedTimelinePosition: position.percent,
+      selectedLevel: temporalDiagnostics ? temporalDiagnostics.selectedLevel : null,
+      selectedFrameCount: temporalDiagnostics ? temporalDiagnostics.selectedFrameCount : 0,
+      estimatedSecondsPerFrame: temporalDiagnostics
+        ? temporalDiagnostics.estimatedSecondsPerFrame
+        : 0,
+      bucketStartSeconds: temporalDiagnostics ? temporalDiagnostics.bucketStartSeconds : 0,
+      bucketEndSeconds: temporalDiagnostics ? temporalDiagnostics.bucketEndSeconds : 0,
+      bucketCenterSeconds: temporalDiagnostics ? temporalDiagnostics.bucketCenterSeconds : 0,
+      alternativeFormats: temporalDiagnostics ? temporalDiagnostics.alternativeFormats : []
+    };
+    logStoryboardForensics(
+      state,
+      'frameMapped',
+      mappedDetails,
+      String(frame.url) + '|' + frame.frameIndex
+    );
     loadTimelineFrame(state, frame, position, token);
   }
 
@@ -6719,6 +8461,7 @@
 
     const settings = Object.assign({ restoreFocus: true }, options);
     const state = activeOverlay;
+    disarmPreviewAdGuard(state, 'overlay-closed');
     const seekStateBeforeClose = getSeekInteractionStateSnapshot(state);
     const seekRequestBeforeClose = state.seekActiveForensicRequest;
     activeOverlay = null;
@@ -6836,6 +8579,16 @@
     state.overlay.remove();
     unlockPageScroll();
 
+    if (historyNativeFallbackSession && historyNativeFallbackSession.card === state.card) {
+      const fallbackCard = historyNativeFallbackSession.card;
+      cleanupHistoryNativeFallback('overlay-closed');
+      if (window.location.pathname === '/feed/history' && fallbackCard.isConnected &&
+        isHistoryThumbnailHovered(fallbackCard)) {
+        lastHoveredCard = fallbackCard;
+        queueHistoryNativeFallback(fallbackCard);
+      }
+    }
+
     if (settings.restoreFocus && state.previousFocus && state.previousFocus.isConnected) {
       try {
         state.previousFocus.focus({ preventScroll: true });
@@ -6921,6 +8674,11 @@
       closeButton: elements.closeButton,
       previousFocus: previousFocus,
       videoId: getVideoIdFromKey(cardVideoKey || previewVideoKey),
+      generation: previewAttemptId,
+      surface: 'overlay',
+      adSessionId: createBridgeNonce(),
+      adGuard: null,
+      nativePreviewPlayer: null,
       elements: elements,
       controls: elements.controls,
       handleKeydown: null,
@@ -6960,6 +8718,7 @@
       captionWindowGenerations: new Map(),
       captionLastMutationDebug: null,
       captionLastForensicSnapshot: null,
+      captionLastVisualClear: null,
       captionInfo: null,
       captionCatalog: null,
       captionCatalogLoaded: false,
@@ -7138,6 +8897,7 @@
       lockPageScroll();
       setPageInert(state);
       bindVideoControls(state);
+      armPreviewAdGuard(state);
       schedulePreviewPlayback(state, PLAYBACK_RETRY_LIMIT);
 
       window.requestAnimationFrame(function () {
@@ -7150,6 +8910,7 @@
       if (activeOverlay === state) {
         closePreviewOverlay({ restoreFocus: false });
       } else {
+        disarmPreviewAdGuard(state, 'overlay-mount-failed');
         clearSeekAssociation(state);
         if (state.placeholder.isConnected) {
           state.placeholder.replaceWith(mediaRoot);
@@ -7197,8 +8958,11 @@
 
   function handleNavigation() {
     previewAttemptId += 1;
+    stopHomeYtActionProvenance(homeYtActionProvenanceSession, 'navigation');
+    stopHomeYtActionTargetLifecycle(globalThis.__ytpmHomeTargetLifecycle, 'navigation');
     removePreviewNotice();
     closePreviewOverlay({ restoreFocus: false });
+    cancelHistoryNativeFallbackIntent();
     restoreButtonToCard();
     queueFullScan();
   }
@@ -7233,7 +8997,10 @@
 
   function handlePageHide(event) {
     previewAttemptId += 1;
+    stopHomeYtActionProvenance(homeYtActionProvenanceSession, 'navigation');
+    stopHomeYtActionTargetLifecycle(globalThis.__ytpmHomeTargetLifecycle, 'navigation');
     closePreviewOverlay({ restoreFocus: false });
+    cancelHistoryNativeFallbackIntent();
     restoreButtonToCard();
     removePreviewNotice();
 
@@ -7241,7 +9008,6 @@
       observer.disconnect();
       observer = null;
     }
-
     if (scanFrame) {
       window.cancelAnimationFrame(scanFrame);
     }
@@ -7251,6 +9017,7 @@
     previewSyncRequested = false;
 
     document.removeEventListener('mouseover', handleCardHover, true);
+    document.removeEventListener('mouseout', handleCardHoverExit, true);
     document.removeEventListener('yt-navigate-start', handleNavigation);
     document.removeEventListener('yt-navigate-finish', handleNavigation);
     window.removeEventListener('popstate', handleNavigation);
@@ -7313,9 +9080,15 @@
         return '';
       }
     };
+
     const helpers = Object.freeze({
       captionSnapshot: getManualCaptionForensicSnapshot,
       seekSnapshot: getManualSeekForensicSnapshot,
+      logHistoryOwnershipEnd: logHistoryOwnershipEnd,
+      logHistoryOwnershipEndSchedule: logHistoryOwnershipEndSchedule,
+      logHistoryOwnershipEndCancel: logHistoryOwnershipEndCancel,
+      scheduleHistoryOwnershipEnd: scheduleHistoryOwnershipEnd,
+      cancelHistoryOwnershipEnd: cancelHistoryOwnershipEnd,
       export: function () {
         return forensicLogBuffer.slice();
       },
@@ -7343,12 +9116,18 @@
     window.addEventListener('ytpm-debug-seek-snapshot', function (event) {
       getManualSeekForensicSnapshot(readLabel(event));
     });
+    window.addEventListener('ytpm-debug-history-native-fallback', function (event) {
+      requestHistoryNativeFallback(event);
+    });
     window.addEventListener('ytpm-debug-dump', function () {
       const data = forensicLogBuffer.slice();
       console.debug('[YTPM][ForensicsJSON]\n' + JSON.stringify(data, null, 2));
     });
     window.addEventListener('ytpm-debug-clear', function () {
       forensicLogBuffer.splice(0, forensicLogBuffer.length);
+      if (historyNativeFallbackSession) {
+        cleanupHistoryNativeFallback('debug-clear');
+      }
       console.debug('[YTPM][ForensicsDump]', 'cleared');
     });
     forensicLog('Forensics', 'helpersReady', {
@@ -7356,6 +9135,7 @@
       pageContextEvents: [
         'ytpm-debug-caption-snapshot',
         'ytpm-debug-seek-snapshot',
+        'ytpm-debug-history-native-fallback',
         'ytpm-debug-dump',
         'ytpm-debug-clear'
       ]
@@ -7374,6 +9154,7 @@
     startObserver();
 
     document.addEventListener('mouseover', handleCardHover, true);
+    document.addEventListener('mouseout', handleCardHoverExit, true);
     document.addEventListener('yt-navigate-start', handleNavigation);
     document.addEventListener('yt-navigate-finish', handleNavigation);
     window.addEventListener('popstate', handleNavigation);

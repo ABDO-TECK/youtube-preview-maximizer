@@ -10,10 +10,15 @@
     'fetch-captions',
     'captions-info',
     'set-captions-enabled',
-    'seek-preview'
+    'seek-preview',
+    'preview-ad-status',
+    'history-native-fallback-prepare',
+    'history-native-fallback-load',
+    'history-ad-hold-break-load',
   ]);
   const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
   const PREVIEW_SELECTOR = 'ytd-video-preview';
+  const HISTORY_FALLBACK_CLASS = 'ytpm-history-native-fallback-active';
   const PREVIEW_PLAYER_SELECTOR = [
     '#inline-preview-player',
     '.html5-video-player',
@@ -27,6 +32,9 @@
   const VIDEO_ASSOCIATION_PATTERN = /^[a-f0-9]{32}$/;
   const ACTIVE_VIDEO_ASSOCIATION_ATTRIBUTE = 'data-ytpm-active-video-association';
   const ACTIVE_PLAYER_ASSOCIATION_ATTRIBUTE = 'data-ytpm-active-player-association';
+  const PREVIEW_AD_SESSION_ATTRIBUTE = 'data-ytpm-preview-ad-session';
+  const PREVIEW_AD_VIDEO_ATTRIBUTE = 'data-ytpm-preview-ad-video-id';
+  const PREVIEW_AD_SESSION_PATTERN = /^[a-f0-9]{32}$/;
   const PLAYER_VIDEO_SYNC_TOLERANCE = 1.5;
   // Temporary runtime-forensics switch. This mirrors the content-script gate.
   const DEBUG_LOGGING = true;
@@ -121,6 +129,92 @@
     return nestedPlayer || null;
   }
 
+  function getHistoryFallbackCard(videoId) {
+    const cards = Array.from(document.querySelectorAll('ytd-rich-item-renderer,ytd-video-renderer,ytd-grid-video-renderer,ytd-compact-video-renderer,ytd-playlist-video-renderer,ytd-reel-item-renderer,yt-lockup-view-model')).filter(function (card) {
+      const link = card.querySelector('a#thumbnail,a[href*="/watch"],a[href*="/shorts/"]');
+      return link && getVideoIdFromUrl(link.href || link.getAttribute('href')) === videoId;
+    });
+    return cards.find(function (card) { return card.classList.contains(HISTORY_FALLBACK_CLASS); }) ||
+      cards.find(function (card) { return card.matches(':hover') || card.querySelector(':hover'); }) || cards[0] || null;
+  }
+
+  function getHistoryFallbackPrepareState(videoId, card, outer, preview) {
+    const inner = outer && outer.querySelector('.html5-video-player#inline-preview-player');
+    return { requestedVideoId: videoId, cardPresent: Boolean(card), previewPresent: Boolean(preview), previewActive: Boolean(preview && preview.hasAttribute('active')), naturallyHovered: Boolean(card && (card.matches(':hover') || card.querySelector(':hover'))), trueInnerPlayerPresent: Boolean(inner), trueInnerPlayerConnected: Boolean(inner && inner.isConnected), trueInnerPlayerVisible: Boolean(inner && isVisibleNode(inner)) };
+  }
+
+  function prepareHistoryFallbackPlayer(videoId) {
+    const requestedVideoId = normalizeVideoId(videoId);
+    if (window.location.pathname !== '/feed/history' || !requestedVideoId) {
+      return { ok: false, reason: window.location.pathname !== '/feed/history' ? 'history-only' : 'invalid-video-id' };
+    }
+    const card = getHistoryFallbackCard(requestedVideoId);
+    const preview = document.querySelector(PREVIEW_SELECTOR);
+    const outer = document.querySelector('ytd-player#inline-player');
+    const inner = outer && outer.querySelector('.html5-video-player#inline-preview-player');
+    const before = getHistoryFallbackPrepareState(requestedVideoId, card, outer, preview);
+    const preparePlayer = outer && outer.preparePlayer;
+    if (!card || !preview || before.previewActive || !before.naturallyHovered || !outer || inner || typeof preparePlayer !== 'function') {
+      const reason = !card ? 'target-card-not-found' : !preview ? 'preview-not-found' : before.previewActive ? 'preview-already-active' : !before.naturallyHovered ? 'target-not-naturally-hovered' : !outer ? 'outer-player-not-found' : inner ? 'inner-player-already-present' : 'prepare-player-unavailable';
+      return { ok: false, reason: reason };
+    }
+    try {
+      preparePlayer.call(outer);
+      return { ok: true, invoked: true };
+    } catch (error) {
+      return { ok: false, reason: 'prepare-player-threw' };
+    }
+  }
+  function loadHistoryFallbackVideo(videoId, generation) {
+    const requestedVideoId = normalizeVideoId(videoId);
+    if (window.location.pathname !== '/feed/history' || !requestedVideoId) {
+      return { ok: false, reason: window.location.pathname !== '/feed/history' ? 'wrong-pathname' : 'invalid-video-id', generation: generation, outerPresent: false, innerPresent: false, loadMethodPresent: false, loadInvoked: false, videoPresentBefore: false, videoPresentAfterImmediate: false, pausedAfterImmediate: null, readyStateAfterImmediate: null };
+    }
+    const card = getHistoryFallbackCard(requestedVideoId);
+    const preview = document.querySelector(PREVIEW_SELECTOR);
+    const outer = document.querySelector('ytd-player#inline-player');
+    const inner = outer && outer.querySelector('.html5-video-player#inline-preview-player');
+    const cardStillHovered = Boolean(card && (card.matches(':hover') || card.querySelector(':hover')));
+    if (!card || !cardStillHovered) {
+      return { ok: false, reason: !card ? 'target-card-not-found' : 'target-card-not-hovered', generation: generation, outerPresent: Boolean(outer), innerPresent: Boolean(inner), loadMethodPresent: Boolean(inner && typeof inner.loadVideoById === 'function'), loadInvoked: false, videoPresentBefore: Boolean(inner && inner.querySelector('video')), videoPresentAfterImmediate: false, pausedAfterImmediate: null, readyStateAfterImmediate: null };
+    }
+    if (!preview || !outer || !inner || !inner.isConnected || !inner.loadVideoById) {
+      return { ok: false, reason: !preview ? 'preview-not-found' : !outer ? 'outer-player-not-found' : !inner ? 'inner-player-not-found' : !outer.isConnected ? 'outer-player-disconnected' : !inner.isConnected ? 'inner-player-disconnected' : 'load-video-by-id-unavailable', generation: generation, outerPresent: Boolean(outer), innerPresent: Boolean(inner), loadMethodPresent: Boolean(inner && typeof inner.loadVideoById === 'function'), loadInvoked: false, videoPresentBefore: Boolean(inner && inner.querySelector('video')), videoPresentAfterImmediate: false, pausedAfterImmediate: null, readyStateAfterImmediate: null };
+    }
+    const videoBefore = inner.querySelector('video');
+    const baseResult = { ok: false, reason: '', generation: generation, outerPresent: true, innerPresent: true, loadMethodPresent: true, loadInvoked: false, videoPresentBefore: Boolean(videoBefore), videoPresentAfterImmediate: false, pausedAfterImmediate: null, readyStateAfterImmediate: null };
+    try {
+      inner.loadVideoById(requestedVideoId);
+      const videoAfter = inner.querySelector('video');
+      baseResult.ok = true;
+      baseResult.reason = null;
+      baseResult.loadInvoked = true;
+      baseResult.videoPresentAfterImmediate = Boolean(videoAfter);
+      baseResult.pausedAfterImmediate = videoAfter ? Boolean(videoAfter.paused) : null;
+      baseResult.readyStateAfterImmediate = videoAfter ? Number(videoAfter.readyState) : null;
+      return Object.assign({ invoked: true }, baseResult);
+    } catch (error) {
+      baseResult.reason = 'load-video-by-id-threw';
+      baseResult.errorName = error && error.name ? String(error.name).slice(0, 80) : 'Error';
+      return baseResult;
+    }
+  }
+
+  function loadOwnedHistoryHoldBreakVideo(videoId, sessionId) {
+    const context = getOwnedPreviewAdContext(videoId, sessionId);
+    const player = context && context.player;
+    if (window.location.pathname !== '/feed/history' || !context || !context.playerElement || !context.playerElement.isConnected || !player || typeof player.loadVideoById !== 'function') {
+      return { ok: false, loadInvoked: false, loadThrew: false };
+    }
+    try { player.loadVideoById(normalizeVideoId(videoId)); return { ok: true, loadInvoked: true, loadThrew: false }; }
+    catch (error) { return { ok: false, loadInvoked: false, loadThrew: true }; }
+  }
+
+  function logHistoryLoadFailure(result) {
+    if (!result || result.ok === true || result.reason === 'target-card-not-hovered' || typeof console === 'undefined' || typeof console.debug !== 'function') return;
+    console.debug('[YTPM][HistoryLoadFailure]', 'generation=' + String(result.generation == null ? '' : result.generation), 'reason=' + String(result.reason || 'unknown'), 'outerPresent=' + String(result.outerPresent === true), 'innerPresent=' + String(result.innerPresent === true), 'loadMethodPresent=' + String(result.loadMethodPresent === true), 'loadInvoked=' + String(result.loadInvoked === true));
+  }
+
   function normalizeVideoId(value) {
     const normalized = String(value || '')
       .replace(/^(watch|shorts|live):/, '');
@@ -203,6 +297,84 @@
       preview: preview,
       player: getApiPlayer(player) || player
     };
+  }
+
+  function getOwnedPreviewAdContext(videoId, sessionId) {
+    const requestedVideoId = normalizeVideoId(videoId);
+    if (!requestedVideoId || typeof sessionId !== 'string' ||
+      !PREVIEW_AD_SESSION_PATTERN.test(sessionId)) {
+      return null;
+    }
+
+    const previews = Array.from(document.querySelectorAll(PREVIEW_SELECTOR)).filter(function (preview) {
+      return preview.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) === sessionId &&
+        preview.getAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE) === requestedVideoId;
+    });
+    if (previews.length !== 1) {
+      return null;
+    }
+
+    // History fallback intentionally moves the owned outer player into the
+    // hovered thumbnail. Resolve by the unguessable session attribute rather
+    // than assuming the player remains a descendant of its preview shell.
+    const playerElements = Array.from(document.querySelectorAll(
+      '[' + PREVIEW_AD_SESSION_ATTRIBUTE + ']'
+    )).filter(function (candidate) {
+      return candidate.getAttribute(PREVIEW_AD_SESSION_ATTRIBUTE) === sessionId &&
+        candidate.getAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE) === requestedVideoId &&
+        candidate.matches('.html5-video-player, #inline-preview-player, ytd-player#inline-player');
+    });
+    if (playerElements.length !== 1 || !playerElements[0].isConnected) {
+      return null;
+    }
+
+    return {
+      preview: previews[0],
+      playerElement: playerElements[0],
+      player: getApiPlayer(playerElements[0]) || playerElements[0]
+    };
+  }
+
+  function getPreviewAdStatus(context) {
+    if (!context || !context.playerElement || !context.playerElement.isConnected) {
+      return { ok: false, active: false, confidence: 'none', reason: 'player-unavailable', requestedVideoIdMatches: false };
+    }
+
+    const player = context.playerElement;
+    const reportedVideoId = normalizeVideoId(getVideoData(context.player) && getVideoData(context.player).video_id);
+    const requestedVideoId = normalizeVideoId(context.preview.getAttribute(PREVIEW_AD_VIDEO_ATTRIBUTE));
+    const association = {
+      associationSource: 'owned-player-getVideoData',
+      associationAvailable: Boolean(reportedVideoId),
+      associationMatchesRequested: Boolean(reportedVideoId && requestedVideoId && reportedVideoId === requestedVideoId),
+      playerReportedVideoIdPresent: Boolean(reportedVideoId),
+      playerReportedVideoIdMatches: Boolean(reportedVideoId && requestedVideoId && reportedVideoId === requestedVideoId)
+    };
+    const controller = { playerState: null, playerCurrentTime: null, playerDuration: null, loadedFraction: null, playerVideoIdPresent: Boolean(reportedVideoId), playerVideoIdMatchesRequested: Boolean(reportedVideoId && requestedVideoId && reportedVideoId === requestedVideoId) };
+    try { const value = Number(context.player && context.player.getPlayerState && context.player.getPlayerState()); controller.playerState = Number.isFinite(value) ? value : null; } catch (error) {}
+    try { const value = Number(context.player && context.player.getCurrentTime && context.player.getCurrentTime()); controller.playerCurrentTime = Number.isFinite(value) && value >= 0 ? value : null; } catch (error) {}
+    try { const value = Number(context.player && context.player.getDuration && context.player.getDuration()); controller.playerDuration = Number.isFinite(value) && value >= 0 ? value : null; } catch (error) {}
+    try { const value = Number(context.player && context.player.getVideoLoadedFraction && context.player.getVideoLoadedFraction()); controller.loadedFraction = Number.isFinite(value) && value >= 0 && value <= 1 ? value : null; } catch (error) {}
+    const playerNodes = [player].concat(Array.from(player.querySelectorAll('.html5-video-player')));
+    for (const playerNode of playerNodes) {
+      const classReason = ['ad-showing', 'ad-interrupting', 'ad-created'].find(function (className) {
+        return playerNode.classList.contains(className) || playerNode.hasAttribute(className) ||
+          playerNode.getAttribute('data-' + className) === 'true';
+      });
+      if (classReason) {
+        return Object.assign({ ok: true, active: true, confidence: 'high', reason: classReason,
+          requestedVideoIdMatches: association.associationMatchesRequested }, association, controller);
+      }
+    }
+
+    const activeAdUi = player.querySelector(
+      '.ytp-ad-player-overlay,.ytp-ad-text,.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-ad-module,.ytp-ad-overlay-container'
+    );
+    if (activeAdUi && isVisibleNode(activeAdUi)) {
+      return Object.assign({ ok: true, active: true, confidence: 'high', reason: 'active-ad-ui', requestedVideoIdMatches: false }, association, controller);
+    }
+
+    return Object.assign({ ok: true, active: false, confidence: 'high', reason: 'content', requestedVideoIdMatches: association.associationMatchesRequested }, association, controller);
   }
 
   function readPlayerCurrentTime(player) {
@@ -1329,6 +1501,20 @@
     const data = payload && typeof payload === 'object' && !Array.isArray(payload)
       ? payload
       : {};
+    if (command === 'history-native-fallback-prepare') {
+      return prepareHistoryFallbackPlayer(data.videoId);
+    }
+    if (command === 'history-native-fallback-load') {
+      const result = loadHistoryFallbackVideo(data.videoId, data.generation);
+      logHistoryLoadFailure(result);
+      return result;
+    }
+    if (command === 'history-ad-hold-break-load') {
+      return loadOwnedHistoryHoldBreakVideo(data.videoId, data.sessionId);
+    }
+    if (command === 'preview-ad-status') {
+      return getPreviewAdStatus(getOwnedPreviewAdContext(data.videoId, data.sessionId));
+    }
     const context = getPreviewContext(data.videoId);
     const player = context ? context.player : null;
 

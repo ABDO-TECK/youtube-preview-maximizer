@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>YTPM Mock Inline Player Lab</title>
+<link rel="stylesheet" href="lab.css">
+<h1>YTPM Mock Inline Player Lab</h1>
+<label>Scenario <select id="scenario">
+  <option value="video-clean">Clean</option><option value="video-preroll">Pre-roll</option>
+  <option value="video-multiple">Multiple ads</option><option value="video-malformed">Malformed</option>
+  <option value="video-delayed">Delayed</option><option value="video-reuse">Reuse</option>
+  <option value="video-race">Race A→B</option><option value="video-stale-ad">Stale Ad State</option>
+  <option value="video-duplicate">Duplicate Response</option><option value="video-nested">Nested Ads</option>
+  <option value="video-cancel">Cancellation</option>
+</select></label>
+<label><input id="sanitize" type="checkbox" checked> Payload sanitizer</label>
+<button id="prepare">Prepare Player</button><button id="load">Load Video</button><button id="stress">Run Stress Scenario</button>
+<div class="status"><div>Generation: <output id="generation">0</output></div><div>Video: <output id="video">-</output></div><div>Prepared: <output id="prepared">no</output></div><div>Ad lifecycle: <output id="ad">no</output></div><div>Content lifecycle: <output id="content">no</output></div><div>Removed: <output id="removed">-</output></div></div>
+<h2>Lifecycle</h2><pre id="events"></pre>
+<script type="module">
+  import { MockInlinePlayer } from './mock-player.js';
+  import { createPayloadSession } from './payload.js';
+  const $ = (id) => document.getElementById(id);
+  let generation = 0, player;
+  const events = [];
+  function render() { $('events').textContent = events.map((event) => typeof event === 'string' ? event : JSON.stringify(event)).join('\n'); }
+  function makePlayer() {
+    const diagnostics = [];
+    const sanitizerSession = $('sanitize').checked ? createPayloadSession({ generation, videoId: $('scenario').value, diagnostics }) : null;
+    player = new MockInlinePlayer({ sanitizer: sanitizerSession && ((raw, context) => sanitizerSession.sanitize(raw, context)), onEvent: (event) => { events.push(event); render(); if (event === 'ad-showing') $('ad').textContent = 'yes'; if (event === 'content-playing') $('content').textContent = 'yes'; } });
+    player.preparePlayer(); $('prepared').textContent = 'yes'; $('generation').textContent = generation;
+  }
+  $('prepare').onclick = makePlayer;
+  $('load').onclick = async () => { if (!player) makePlayer(); const id = $('scenario').value; $('video').textContent = id; const result = await player.loadVideoById(id, { scenario: id, generation: ++generation }); $('removed').textContent = (result.removedPaths || []).join(', ') || '-'; render(); };
+  $('stress').onclick = async () => {
+    events.length = 0; generation = 0; player = new MockInlinePlayer({ sanitizerFactory: ({ generation, videoId, loadId }) => createPayloadSession({ generation, videoId, loadId, diagnostics: events }), onEvent: (event, detail) => events.push({ event, ...detail }) });
+    player.preparePlayer(); const choice = $('scenario').value;
+    if (choice === 'video-race') await Promise.all([player.loadVideoById('video-a', { scenario: 'preroll', generation: 1, delayMs: 300 }), player.loadVideoById('video-b', { scenario: 'clean', generation: 2, delayMs: 100 })]);
+    else if (choice === 'video-cancel') { const pending = player.loadVideoById('video-a', { scenario: 'preroll', generation: 1, delayMs: 100 }); player.cancel(); await pending; }
+    else { const scenario = choice.replace(/^video-/, '') === 'nested' ? 'nested' : choice.replace(/^video-/, '') === 'stale-ad' ? 'preroll' : 'clean'; await player.loadVideoById('video-' + scenario, { scenario, generation: 1 }); }
+    $('generation').textContent = player.generation; $('video').textContent = player.videoId; render();
+  };
+  makePlayer();
+</script>

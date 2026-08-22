@@ -1,106 +1,112 @@
 # YouTube Preview Maximizer
 
-إضافة Google Chrome صغيرة تعمل داخل YouTube فقط. عند تحريك المؤشر فوق صورة مصغرة يبدأ YouTube عادةً تشغيل معاينة قصيرة داخل بطاقة الفيديو؛ تضيف الإضافة زر `⛶` فوق الصورة، وعند الضغط عليه تنقل عنصر `video` الخاص بالمعاينة فقط إلى نافذة Overlay كبيرة، ثم تعرض شريط تحكم مخصصًا مستوحى بصريًا من مشغل YouTube، من دون فتح صفحة الفيديو أو تغيير الرابط.
+**YouTube Preview Maximizer** is a lightweight, secure Google Chrome extension (Manifest V3) that enlarges active YouTube thumbnail previews into an in-page, custom overlay player with intuitive controls, closed captions (CC), storyboard hover previews, quality selection, keyboard shortcuts, robust ad lifecycle protections, and fail-safe cleanup — all without opening video watch pages or altering URLs.
 
-## المزايا
+---
 
-- مبنية باستخدام Manifest V3 وVanilla JavaScript وCSS فقط.
-- تعمل على الصفحة الرئيسية، نتائج البحث، الاشتراكات، وصفحات القنوات التي تحتوي على بطاقات فيديو.
-- تدعم عناصر البطاقات الشائعة مثل `ytd-rich-item-renderer` و`ytd-video-renderer` و`ytd-grid-video-renderer` و`ytd-compact-video-renderer`، مع بدائل مرنة لاكتشاف حاوية الصورة.
-- تستخدم `MutationObserver` لاكتشاف البطاقات التي يضيفها YouTube أثناء عمله كتطبيق SPA، وتستخدم `data-ytpm-processed` لمنع تكرار الأزرار.
-- عند بدء معاينة YouTube العامة، تنقل الإضافة الزر نفسه مؤقتًا إلى حاوية المعاينة ليبقى فوق طبقة الفيديو، ثم تعيده إلى الصورة المصغرة عند انتهائها دون إنشاء زر ثانٍ.
-- يمكن إغلاق الـOverlay بواسطة زر `×` أو مفتاح `Escape` أو النقر على المساحة الداكنة خارج الفيديو.
-- يبني Overlay مشغلًا مخصصًا بأيقونات SVG وتخطيط قريب من YouTube: تشغيل، صوت، CC، إعدادات الجودة، ملء الشاشة، وشريط تقدم أحمر.
-- يختفي شريط التحكم وزر `×` بعد خمس ثوانٍ من ترك الماوس، ويظهران مجددًا عند تحريك الماوس أو لمس المشغّل.
-- اختصارات لوحة المفاتيح داخل الـOverlay: `←` و`→` للتقديم/الرجوع 5 ثوانٍ، `Space` أو `K` للتشغيل/الإيقاف، `M` للصوت، `C` للكابشنز، و`F` للملء الكامل للشاشة.
-- تقرأ الإضافة مستويات الجودة وتتحكم بها من Player API داخل الصفحة عبر جسر معزول؛ لذلك لا تتوقف القائمة عند `Auto` عندما يكشف الـPreview مستويات أخرى، مع إبقاء قائمة الإعدادات المخصصة هي الواجهة الأساسية.
-- تعرض قائمة الجودة علامة `✓` بجانب الجودة الفعلية الحالية، وتحدّثها بعد اختيار مستوى جديد.
-- تتضمن الإضافة أيقونة PNG مخصصة بأحجام 16 و32 و48 و128 بكسل.
-- يربط زر CC المخصص بمسارات `captionTracks` عند توفرها؛ وإذا لم يعرّض Preview مسارًا مباشرًا، تجلب الإضافة الترجمة النصية فقط وتضيفها كـWebVTT مؤقت داخل عنصر الفيديو نفسه.
-- لا تضيف الإضافة إعلانات ولا تنشئ أزرارًا لبطاقات الإعلانات أو المحتوى المروّج.
-- يحافظ الفيديو على نسبة العرض والارتفاع باستخدام `object-fit: contain`.
-- لا تطلب الإضافة صلاحيات إضافية. تستخدم فقط عنصر `video` الحالي الذي ينشئه YouTube للمعاينة، ولا تحمّل الفيديو الكامل أو تنشئ `iframe`.
+## Key Features
 
-## التثبيت محليًا
+- **Manifest V3 & Vanilla Stack**: Built with pure Vanilla JavaScript and CSS with zero external runtime npm dependencies.
+- **Universal Surface Compatibility**: Seamlessly works on YouTube Home, Search Results, Subscriptions, Channel pages, and History.
+- **Dynamic In-Page Overlay**: Transposes the active preview `<video>` element into a maximized custom overlay with YouTube-inspired SVG controls, a red interactive timeline bar, audio/mute controls, and fullscreen toggle.
+- **Auto-Hiding Interface**: Controls and close button automatically fade out after 5 seconds of inactivity and reappear upon pointer movement.
+- **Storyboard Timeline Previews**: Renders precise storyboard sprite preview thumbnails on timeline hover with bounded LRU caching.
+- **Closed Captions (CC)**: Reads native live captions or fetches verified timed-text tracks, rendering real-time WebVTT cues with multiline roll-up support.
+- **Quality Level Selection**: Synchronizes available quality levels directly with the Player API via an isolated page bridge, displaying an active checkmark indicator.
+- **Ad Lifecycle Protection & Presentation Gate**:
+  - **Fail-Closed Presentation Gate**: Keeps the visual player surface hidden until content media is confirmed ready.
+  - **Pre-Presentation Fence**: Suppresses ad UI overlays, titles, gradients, badges, and banners with zero-frame leakage.
+  - **Rapid Re-entry Preload Barrier**: Prevents stale arm-time media residue from driving premature ad progression across fast leave/re-enter cycles.
+  - **Bounded Recovery**: One-shot recovery mechanism for post-ad transitions without endless retries.
+- **Smart DOM & Memory Cleanup**: Automatically restores video elements, cleans up listeners, disconnects MutationObservers, and clears all timers upon closing or card invalidation.
+- **Privacy & Security Focused**:
+  - Permissions strictly scoped to `https://www.youtube.com/*`.
+  - Nonce-based page bridge with allowlisted commands, strict schema validation, and origin verification.
+  - No tracking, analytics, telemetry collection, or remote code execution.
 
-1. افتح Chrome واكتب في شريط العنوان:
+---
 
-   `chrome://extensions`
+## Keyboard Shortcuts
 
-2. فعّل **Developer mode** من أعلى الصفحة.
-3. اضغط **Load unpacked**.
-4. اختر مجلد المشروع الذي يحتوي على `manifest.json`:
+When the preview overlay is open:
 
-   `C:\xampp\htdocs\youtube-preview-maximizer`
+| Key | Action |
+| :--- | :--- |
+| `Space` / `K` | Toggle Play / Pause |
+| `←` / `→` | Seek backward / forward 5 seconds |
+| `M` | Toggle Mute / Unmute |
+| `C` | Toggle Closed Captions (CC) |
+| `F` | Toggle Fullscreen |
+| `Escape` | Close Preview Overlay |
 
-5. إذا كانت الإضافة مثبتة مسبقًا، اضغط زر إعادة التحميل الخاص بها بعد تعديل الملفات، ثم أعد تحميل تبويب YouTube بالكامل (`Ctrl+Shift+R`). تبويب YouTube المفتوح يحتفظ بالـContent Script القديم حتى تتم إعادة تحميله.
+---
 
-## الاختبار على YouTube
+## Local Installation
 
-1. افتح `https://www.youtube.com/` أو صفحة نتائج البحث أو الاشتراكات أو قناة.
-2. مرّر الماوس فوق صورة مصغرة حتى يبدأ YouTube تشغيل الـPreview.
-3. مرّر الماوس فوق الصورة لرؤية زر `⛶` ثم اضغطه.
-4. تحقق من ظهور المعاينة داخل الـOverlay من دون الانتقال إلى صفحة الفيديو.
-5. جرّب أزرار التشغيل والصوت والكابشنز وشريط التقدم، وافتح قائمة الجودة وتأكد من ظهور علامة `✓` بجانب الجودة الفعلية.
-6. جرّب الاختصارات: `Space`/`K`، `M`، `C`، `F`، و`←`/`→`.
-7. جرّب طرق الإغلاق الثلاث، ثم انتقل داخل YouTube أثناء فتح الـOverlay للتأكد من إغلاقه وتنظيفه.
-8. مرّر فوق بطاقة إعلان أو محتوى مروّج إن ظهر، وتأكد من عدم إضافة زر إليها.
-9. جرّب الضغط على الزر في بطاقة لا توفر Preview؛ يجب أن تظهر الرسالة ولا يتم فتح مشغل آخر:
+1. Open Google Chrome and navigate to:
+   ```text
+   chrome://extensions
+   ```
+2. Enable **Developer mode** using the toggle in the top-right corner.
+3. Click **Load unpacked**.
+4. Select the project directory containing `manifest.json`:
+   ```text
+   C:\xampp\htdocs\youtube-preview-maximizer
+   ```
+5. If the extension is already installed, click the **Reload** button on the extension card and refresh open YouTube tabs (`Ctrl + Shift + R`).
 
-   `Move the mouse over the thumbnail until the preview starts, then try again.`
+---
 
-## ملاحظات ومشكلات معروفة
+## Manual Verification
 
-- تعتمد الإضافة على عنصر `video` الذي ينشئه YouTube للمعاينة، وتبحث عنه داخل البطاقة أو داخل حاوية Preview العامة `ytd-video-preview`، ثم تنقله وحده إلى Overlay مخصص. إذا لم تبدأ المعاينة، يظهر تنبيه قصير ولا يتم تحميل الفيديو الكامل.
-- بعض معاينات YouTube لا تعرض `textTracks` في عالم الإضافة المعزول. لهذا تستخدم الإضافة `page-bridge.js` خارجيًا للوصول إلى Player API وبيانات captions فقط، من دون استخدام واجهة مشغل YouTube الأصلية أو `eval` أو JavaScript inline.
-- عند توفر `captionTracks`، تجلب الإضافة بيانات الترجمة النصية فقط، وتحوّلها إلى WebVTT مؤقت وتضيفها إلى عنصر المعاينة نفسه. تحاول اختيار لغة متصفح المستخدم، ثم تستخدم الترجمة الآلية المتاحة من YouTube عند الحاجة. لا يتم تحميل ملف الفيديو الكامل لمسار Preview.
-- مستويات الجودة والكابشنز خصائص يقررها YouTube لكل Preview؛ إذا لم يقدم YouTube مسارات captions أو رفض endpoint الترجمة، سيظهر إشعار واضح بدل ترك الزر يعمل بلا نتيجة.
-- قد يعيد YouTube بناء البطاقة أثناء فتح الـOverlay. عند حذف البطاقة الأصلية تغلق الإضافة الـOverlay وتزيل الفيديو المؤقت بأمان.
-- في صفحات المشاهدة، تربط الإضافة الـPreview بمعرّف بطاقة الفيديو الحالية قبل فتحها؛ وإذا لم يكن الربط موثوقًا لا تختار Preview عشوائيًا من فيديو مقترح آخر.
-- لا تنقل الإضافة `.html5-video-player` ولا تستخدم أزراره أو CSS الخاص به؛ تنقل عنصر المعاينة `video` فقط، وتعيده إلى موضعه الأصلي عند الإغلاق مع الحفاظ قدر الإمكان على الوقت والصوت وحالة التشغيل.
-- عند الإغلاق توقف الإضافة الفيديو قبل إعادته وتمنع استئناف التشغيل التلقائي، حتى لا يستمر صوت المعاينة بعد إغلاق الـOverlay.
-- إذا أزال YouTube البطاقة أو عنصر المعاينة أثناء العرض، يتم إغلاق Overlay وتنظيف العناصر المؤقتة بدل إدخال عنصر في DOM قديم.
-- تغييرات كبيرة في بنية YouTube قد تتطلب إضافة Selector جديد في `content.js`.
-- الإضافة تستهدف `https://www.youtube.com/*` فقط؛ لا تعمل على نطاقات YouTube الأخرى مثل `m.youtube.com` أو `youtube-nocookie.com`.
+1. Navigate to `https://www.youtube.com/` (Home, Search, or History).
+2. Hover over any video thumbnail until YouTube begins playing the inline preview.
+3. Click the `⛶` button located at the top-right corner of the thumbnail.
+4. Verify that the preview opens inside the maximized overlay without redirecting to the watch page.
+5. Test playback controls: Play/Pause, Volume, Timeline scrub, Captions (CC), Quality menu, and Fullscreen.
+6. Verify keyboard shortcuts (`Space`, `K`, `M`, `C`, `F`, `←`, `→`, `Escape`).
+7. Close the overlay using `×`, `Escape`, or by clicking outside the video frame, and verify playback cleanly halts.
 
-## كيف استُخدم Scrapling في فحص YouTube؟
+---
 
-اُستخدم Scrapling خارج الإضافة لتحليل HTML الأولي لصفحة YouTube واختبار Selectors المرنة. أظهر الفحص أن HTML الأولي لا يحتوي على مشغل Preview مكتمل؛ لأن YouTube ينشئه بعد hydration داخل المتصفح. لذلك تم فحص DOM الحي بعد بدء المعاينة لتثبيت البنية المرئية والأبعاد المستوحاة من مشغل YouTube، من دون نسخ مشغله أو نقله إلى Overlay. البنية التي تم الاعتماد عليها بصريًا تتضمن:
-
-- `ytd-video-preview[active]` كحاوية Preview عامة، وقد تكون خارج بطاقة الفيديو الأصلية.
-- `ytd-player#inline-player` ثم `.html5-video-player#inline-preview-player` وعنصر `video.video-stream.html5-main-video` داخله، وتظهر في DOM الحي مجموعات تحكم مثل `ytp-left-controls` و`ytp-right-controls` وشريط `ytp-progress-bar-container`. استُخدمت هذه العلاقات لتصميم DOM مخصص بأسماء `ytpm-*`، وليس لإعادة استخدام عناصر YouTube.
-- مصدر المعاينة الحالي يكون غالبًا `blob:`، لذلك لا تنشئ الإضافة مصدرًا جديدًا ولا تحاول تحميل الفيديو الكامل.
-- Player قد يكشف `getVideoData()` لمعرّف الفيديو، و`getAvailableQualityLevels()` و`setPlaybackQuality()` و`setPlaybackQualityRange()` للجودة. تستخدم الإضافة هذه الواجهات عبر `page-bridge.js` عندما تكون متاحة، مع مسار DOM مباشر كبديل.
-- بعض المعاينات لا تكشف `textTracks` أو مسارات captions مباشرة؛ لذلك تستخرج الإضافة مسار الترجمة من Player Response وتحوّله إلى WebVTT مؤقت عند الحاجة. إذا لم يقدم YouTube `captionTracks` فلن يمكن عرض ترجمة غير موجودة في بيانات المعاينة دون تحميل الفيديو الكامل، وهو ما لا تفعله الإضافة.
-
-لا يتم تضمين Scrapling أو Python داخل Chrome Extension؛ فدوره هنا هو فحص بنية YouTube المتغيرة ومقارنة DOM الثابت بالـDOM الحي واكتشاف Selectors والعلاقات المناسبة، بينما يحتاج التنفيذ النهائي داخل Chrome إلى DOM حي وعنصر `HTMLVideoElement` و`MutationObserver` في `content.js`.
-
-## بنية الملفات
+## Project Structure
 
 ```text
 youtube-preview-maximizer/
-├── manifest.json   # إعداد Manifest V3 وContent Script والأيقونات
-├── icons/          # أيقونات PNG الخاصة بالإضافة
-│   ├── icon16.png
-│   ├── icon32.png
-│   ├── icon48.png
-│   └── icon128.png
-├── content.js      # اكتشاف البطاقات، الزر، الـOverlay، والمراقبة والتنظيف
-├── page-bridge.js  # جسر خارجي إلى Player API وبيانات captions داخل عالم صفحة YouTube
-├── styles.css      # تنسيقات الزر والـOverlay والإشعار للوضعين الفاتح والداكن
-└── README.md       # تعليمات التثبيت والاختبار والملاحظات
+├── manifest.json            # Manifest V3 extension configuration & permissions
+├── background.js            # Service worker for verified timed-text fetching
+├── content.js               # In-page card observation, overlay player, and lifecycle management
+├── preview-ad-guard.js      # PresentationGate, AdUiGate, RapidReentryBarrier, and ad protection
+├── page-bridge.js           # Isolated bridge to YouTube Player API for quality and caption tracks
+├── caption-utils.js         # Caption formatting, WebVTT cue generation, and storyboard mapping
+├── styles.css               # Overlay geometry, controls styling, and visual fence rules
+├── icons/                   # Extension icons (16px, 32px, 48px, 128px)
+├── tests/                   # Automated unit & integration test suites
+└── lab/                     # Player response sanitizer & lab tests
 ```
 
-## الصلاحيات وCSP
+---
 
-يحتوي `manifest.json` على `host_permissions` لنطاق `https://www.youtube.com/*` لأن Service Worker يحتاج إلى جلب Player Response ومسارات captions من YouTube. ملف `page-bridge.js` مورد JavaScript خارجي مسموح به فقط لنطاق YouTube عبر `web_accessible_resources`، ولا يستخدم Inline JavaScript أو `eval`. هذا يحافظ على CSP الخاصة بـManifest V3.
+## Automated Testing
 
-## Current security model (v1.8+)
+Run the test suite from Windows PowerShell / Terminal:
 
-The current implementation intentionally declares `https://www.youtube.com/*` as a host permission because the MV3 service worker must fetch YouTube player responses and caption tracks. Those requests are restricted to the exact HTTPS YouTube origin, validate video IDs and caption URLs, enforce response-size and timeout limits, deduplicate concurrent work, and keep only short-lived bounded caches.
+```bash
+# Run all unit and regression tests
+npm test
 
-`page-bridge.js` is limited to the player operations that require YouTube's page-world API. Requests use an extension-generated nonce, exact-origin checks, an allowlisted command set, and strict payload validation. Its caption fallback can fetch only a validated `/api/timedtext` URL for the requested video, with credentials, a timeout, and a response-size limit; it cannot fetch arbitrary page URLs.
+# Run caption and storyboard tests
+node --test tests/caption-utils.test.mjs
 
-Caption loading first reads the live preview player's caption tracks and translation languages, then tries the page-context timed-text request (which preserves YouTube's page session) before the bounded service-worker fallback. The result is installed as WebVTT cues on the overlay video. The timeline consumes YouTube's bounded storyboard specification and displays the matching sprite tile on hover, with a small LRU URL cache and cleanup when the overlay closes.
+# Run lab player sanitizer tests
+node --test lab/tests/*.test.mjs
+```
 
-The repository has no runtime npm dependencies. Run `node --test tests/caption-utils.test.mjs` (or `npm.cmd test` in Windows PowerShell) to execute the caption parsing and URL-validation regression tests before loading the unpacked extension in Chrome.
+---
+
+## Security Model
+
+- **Host Permissions**: Limited exclusively to `https://www.youtube.com/*`.
+- **Content Security Policy (CSP)**: Fully compliant with Manifest V3 (`script-src 'self'`). No `eval`, inline scripts, or remote code execution.
+- **Isolated Page Bridge**: `page-bridge.js` communicates with `content.js` through `window.postMessage` using extension-generated nonces, origin verification, and strict payload type checking.
+- **Safe Timed-Text Endpoint**: Caption requests validate YouTube origin, enforce strict response size and timeout limits, and only parse valid `/api/timedtext` URLs.

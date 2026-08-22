@@ -286,6 +286,40 @@ test('mirrors only roll-up caption segments geometrically presented in the clip'
   assert.equal(utils.getCaptionSegmentMirrorPlan(barelyLeaving, clip, 0.5).shouldMirror, false);
 });
 
+test('requires physical geometry entry before previewing a one-line roll-up successor', () => {
+  const clip = { left: 0, right: 300, top: 100, bottom: 140, width: 300, height: 40 };
+  const rawOnly = { left: 0, right: 300, top: 145, bottom: 165, width: 300, height: 20 };
+  const entering = { left: 0, right: 300, top: 135, bottom: 155, width: 300, height: 20 };
+  const rawOnlyEntry = utils.getCaptionGeometryEntryPlan(rawOnly, clip);
+  const enteringEntry = utils.getCaptionGeometryEntryPlan(entering, clip);
+
+  assert.equal(rawOnlyEntry.hasGeometryEntry, false);
+  assert.equal(enteringEntry.hasGeometryEntry, true);
+  assert.equal(enteringEntry.visibleHeightRatio, 0.25);
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    utils.getRollupVisualPreviewPlan(['B'], rawOnlyEntry, true)
+  )), {
+    shouldStart: false,
+    reason: 'one-line-no-geometry-entry'
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    utils.getRollupVisualPreviewPlan(['B'], enteringEntry, true)
+  )), {
+    shouldStart: true,
+    reason: 'one-line-geometry-entry-confirmed'
+  });
+  assert.equal(
+    utils.getRollupVisualPreviewPlan(['B'], enteringEntry, false).shouldStart,
+    false
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    utils.getRollupVisualPreviewPlan(['B1', 'B2'], rawOnlyEntry, false)
+  )), {
+    shouldStart: true,
+    reason: 'multiline-existing-preview-policy'
+  });
+});
+
 test('resolves complete roll-up paragraphs into extension-owned transitions', () => {
   const fourLineParagraph = utils.normalizeCaptionLines(['L1', 'L2', 'L3', 'L4']);
   assert.equal(fourLineParagraph, 'L1\nL2\nL3\nL4');
@@ -639,6 +673,24 @@ test('maps realistic storyboard specs across first, middle, and last sprite cell
     utils.getStoryboardFrame({ ...catalog.storyboard, duration: 0 }, 0, 0),
     null
   );
+
+  const diagnostics = utils.getStoryboardTemporalDiagnostics(catalog.storyboard, 100, 205);
+  assert.equal(diagnostics.selectedLevel, 1);
+  assert.equal(diagnostics.selectedFrameCount, 205);
+  assert.equal(diagnostics.frameIndex, utils.getStoryboardFrame(catalog.storyboard, 100, 205).frameIndex);
+  assert.equal(diagnostics.estimatedSecondsPerFrame, 1);
+  assert.equal(diagnostics.bucketStartSeconds, 100);
+  assert.equal(diagnostics.bucketEndSeconds, 101);
+  assert.deepEqual(JSON.parse(JSON.stringify(diagnostics.alternativeFormats)), [{
+    level: 0,
+    count: 100,
+    estimatedSecondsPerFrame: 2.05,
+    hypotheticalFrameIndex: 48
+  }]);
+  assert.equal(diagnostics.formats[1].sourceInterval, 10000);
+  assert.equal(diagnostics.formats[1].estimatedSecondsPerFrame, 1);
+  assert.equal(diagnostics.formats[1].name, 'M$M');
+  assert.equal(diagnostics.formats[1].signatureLength, 8);
 });
 
 test('preserves sparse storyboard levels when the recommended level skips malformed data', () => {
@@ -664,6 +716,15 @@ test('preserves sparse storyboard levels when the recommended level skips malfor
   assert.equal(
     utils.getStoryboardFrame(catalog.storyboard, 60, 213).url.includes('/storyboard3_L3/M6.jpg'),
     true
+  );
+  const diagnostics = utils.getStoryboardTemporalDiagnostics(catalog.storyboard, 60, 213);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(diagnostics.formats.map((format) => format.level))),
+    [1, 2, 3]
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(diagnostics.alternativeFormats.map((format) => format.count))),
+    [213, 213]
   );
 });
 

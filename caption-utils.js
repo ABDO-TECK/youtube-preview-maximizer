@@ -464,6 +464,55 @@
     };
   }
 
+  function getCaptionGeometryEntryPlan(segmentRect, effectiveClipRect) {
+    const rect = segmentRect && typeof segmentRect === 'object' ? segmentRect : null;
+    const clip = effectiveClipRect && typeof effectiveClipRect === 'object'
+      ? effectiveClipRect
+      : null;
+    if (!rect || !clip || !Number.isFinite(Number(rect.height)) ||
+      Number(rect.height) <= 0) {
+      return {
+        hasGeometryEntry: false,
+        visibleHeightRatio: 0,
+        visibleRect: null
+      };
+    }
+
+    const visibleRect = intersectCaptionRects(rect, clip);
+    return {
+      hasGeometryEntry: Boolean(visibleRect),
+      visibleHeightRatio: visibleRect
+        ? visibleRect.height / Number(rect.height)
+        : 0,
+      visibleRect: visibleRect
+    };
+  }
+
+  function getRollupVisualPreviewPlan(expectedSuccessorLines, geometryEntryEvidence, hasRollupMotion) {
+    const expectedLines = getNormalizedCaptionLineList(expectedSuccessorLines);
+    if (expectedLines.length !== 1) {
+      return {
+        shouldStart: expectedLines.length > 1,
+        reason: expectedLines.length > 1
+          ? 'multiline-existing-preview-policy'
+          : 'no-expected-successor'
+      };
+    }
+
+    if (!geometryEntryEvidence || geometryEntryEvidence.hasGeometryEntry !== true ||
+      hasRollupMotion !== true) {
+      return {
+        shouldStart: false,
+        reason: 'one-line-no-geometry-entry'
+      };
+    }
+
+    return {
+      shouldStart: true,
+      reason: 'one-line-geometry-entry-confirmed'
+    };
+  }
+
   function getSeekExecutionPlan(targetBuffered, playerSeekAvailable) {
     if (playerSeekAvailable !== true) {
       return [{ stage: 'video-fallback', allowSeekAhead: null }];
@@ -880,6 +929,77 @@
     };
   }
 
+  function getStoryboardTemporalDiagnostics(storyboard, seconds, duration) {
+    if (!storyboard || !Array.isArray(storyboard.formats) || !storyboard.formats.length) {
+      return null;
+    }
+
+    const maxTime = normalizeDuration(duration) || normalizeDuration(storyboard.duration);
+    if (!maxTime) {
+      return null;
+    }
+
+    const requestedSeconds = Number.isFinite(seconds) && seconds >= 0 ? seconds : 0;
+    const boundedSeconds = Math.min(requestedSeconds, maxTime);
+    const selectedFormat = storyboard.formats.find(function (candidate) {
+      return candidate.level === storyboard.recommendedLevel;
+    }) || storyboard.formats[0];
+    const describeFormat = function (format) {
+      const count = Number(format && format.count);
+      const frameIndex = Number.isInteger(count) && count > 0
+        ? Math.min(count - 1, Math.max(0, Math.floor((boundedSeconds / maxTime) * count)))
+        : 0;
+      return {
+        level: format ? format.level : null,
+        width: Number(format && format.width) || 0,
+        height: Number(format && format.height) || 0,
+        count: Number.isInteger(count) && count > 0 ? count : 0,
+        columns: Number(format && format.columns) || 0,
+        rows: Number(format && format.rows) || 0,
+        framesPerSprite: Number(format && format.framesPerSprite) || 0,
+        spriteCount: Number(format && format.spriteCount) || 0,
+        sourceInterval: Number(format && format.sourceInterval) || 0,
+        name: String(format && format.name || '').slice(0, 128),
+        signatureLength: String(format && format.signature || '').length,
+        isRecommended: format === selectedFormat,
+        estimatedSecondsPerFrame: count > 0 ? maxTime / count : 0,
+        hypotheticalFrameIndex: frameIndex
+      };
+    };
+    const formats = storyboard.formats.map(describeFormat);
+    const selected = formats.find(function (format) {
+      return format.isRecommended;
+    }) || formats[0];
+    const bucketStartSeconds = selected.count
+      ? selected.hypotheticalFrameIndex * maxTime / selected.count
+      : 0;
+    const bucketEndSeconds = selected.count
+      ? (selected.hypotheticalFrameIndex + 1) * maxTime / selected.count
+      : 0;
+
+    return {
+      requestedSeconds: requestedSeconds,
+      selectedLevel: selected.level,
+      selectedFrameCount: selected.count,
+      estimatedSecondsPerFrame: selected.estimatedSecondsPerFrame,
+      frameIndex: selected.hypotheticalFrameIndex,
+      bucketStartSeconds: bucketStartSeconds,
+      bucketEndSeconds: bucketEndSeconds,
+      bucketCenterSeconds: (bucketStartSeconds + bucketEndSeconds) / 2,
+      formats: formats,
+      alternativeFormats: formats.filter(function (format) {
+        return !format.isRecommended;
+      }).map(function (format) {
+        return {
+          level: format.level,
+          count: format.count,
+          estimatedSecondsPerFrame: format.estimatedSecondsPerFrame,
+          hypotheticalFrameIndex: format.hypotheticalFrameIndex
+        };
+      })
+    };
+  }
+
   function getCaptionRenderer(response) {
     return response && response.captions &&
       response.captions.playerCaptionsTracklistRenderer
@@ -1108,6 +1228,8 @@
     getSeekConfirmationPlan: getSeekConfirmationPlan,
     intersectCaptionRects: intersectCaptionRects,
     getCaptionSegmentMirrorPlan: getCaptionSegmentMirrorPlan,
+    getCaptionGeometryEntryPlan: getCaptionGeometryEntryPlan,
+    getRollupVisualPreviewPlan: getRollupVisualPreviewPlan,
     getSeekExecutionPlan: getSeekExecutionPlan,
     getCaptionMutationOwnershipPlan: getCaptionMutationOwnershipPlan,
     selectCaptionWindowGeneration: selectCaptionWindowGeneration,
@@ -1124,6 +1246,7 @@
     sanitizeCaptionCatalog: sanitizeCaptionCatalog,
     getSafeStoryboardTemplate: getSafeStoryboardTemplate,
     normalizeStoryboard: normalizeStoryboard,
-    getStoryboardFrame: getStoryboardFrame
+    getStoryboardFrame: getStoryboardFrame,
+    getStoryboardTemporalDiagnostics: getStoryboardTemporalDiagnostics
   });
 })(typeof globalThis === 'object' ? globalThis : self);

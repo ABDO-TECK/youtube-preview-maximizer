@@ -1,0 +1,38 @@
+[
+  {
+    "id": 1001,
+    "priority": 1,
+    "action": { "type": "block" },
+    "condition": {
+      "urlFilter": "||googleads.g.doubleclick.net^",
+      "resourceTypes": ["script", "sub_frame", "xmlhttprequest", "image"]
+    }
+  },
+  {
+    "id": 1002,
+    "priority": 1,
+    "action": { "type": "block" },
+    "condition": {
+      "urlFilter": "||pagead2.googlesyndication.com^",
+      "resourceTypes": ["script", "sub_frame", "xmlhttprequest", "image"]
+    }
+  },
+  {
+    "id": 1003,
+    "priority": 1,
+    "action": { "type": "block" },
+    "condition": {
+      "urlFilter": "||pubads.g.doubleclick.net^",
+      "resourceTypes": ["script", "sub_frame", "xmlhttprequest", "image"]
+    }
+  },
+  {
+    "id": 1004,
+    "priority": 1,
+    "action": { "type": "block" },
+    "condition": {
+      "urlFilter": "||securepubads.g.doubleclick.net^",
+      "resourceTypes": ["script", "sub_frame", "xmlhttprequest", "image"]
+    }
+  }
+]

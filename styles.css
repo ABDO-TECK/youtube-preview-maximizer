@@ -120,6 +120,106 @@ html[dark] .ytpm-maximize-button {
   font: 600 1.05em/1.35 Arial, sans-serif !important;
 }
 
+/* The guard only affects the extension-owned enlarged preview. */
+.ytpm-overlay[data-ytpm-preview-owned="true"][data-ytpm-ad-suppressed="true"] .ytpm-overlay__video {
+  visibility: hidden !important;
+}
+
+/* Fail-closed exact History fallback player surface:
+   Composited parent opacity hides ALL descendant pixels (video, ads, chrome, unknown layouts)
+   while preserving thumbnail visibility beneath and keeping DOM elements queryable. */
+ytd-player.ytpm-history-native-fallback-active[data-ytpm-history-fence="true"],
+ytd-player.ytpm-history-native-fallback-active[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"],
+ytd-player#inline-player.ytpm-history-native-fallback-active[data-ytpm-history-fence="true"],
+ytd-player#inline-player.ytpm-history-native-fallback-active[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transition: none !important;
+}
+
+/* Keep the player surface on its pre-existing thumbnail/background until content is confirmed. */
+[data-ytpm-history-fence="true"] video,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] video {
+  visibility: hidden !important;
+  opacity: 0 !important;
+}
+
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytpm-overlay__ad-shield {
+  display: none !important;
+}
+
+/* Ad UI and player chrome title remain in the DOM so the guard can invoke Skip, but cannot be seen or intercept input. */
+[data-ytpm-history-fence="true"] .ytp-ad-player-overlay,
+[data-ytpm-history-fence="true"] .ytp-ad-text,
+[data-ytpm-history-fence="true"] .ytp-ad-skip-button,
+[data-ytpm-history-fence="true"] .ytp-ad-skip-button-modern,
+[data-ytpm-history-fence="true"] .ytp-ad-skip-button-container,
+[data-ytpm-history-fence="true"] .ytp-ad-module,
+[data-ytpm-history-fence="true"] .ytp-ad-overlay-container,
+[data-ytpm-history-fence="true"] .ytp-ad-preview-container,
+[data-ytpm-history-fence="true"] .ytp-ad-preview-text,
+[data-ytpm-history-fence="true"] .ytp-ad-message-container,
+[data-ytpm-history-fence="true"] .ytp-ad-message,
+[data-ytpm-history-fence="true"] .ytp-ad-persistent-banner,
+[data-ytpm-history-fence="true"] .ytp-ad-image-overlay,
+[data-ytpm-history-fence="true"] .ytp-ad-action-interstitial,
+[data-ytpm-history-fence="true"] .ytp-ad-end-screens-paginated,
+[data-ytpm-history-fence="true"] .ytp-paid-content-overlay,
+[data-ytpm-history-fence="true"] .ytp-ad-badge,
+[data-ytpm-history-fence="true"] .ytp-chrome-top,
+[data-ytpm-history-fence="true"] .ytp-title,
+[data-ytpm-history-fence="true"] .ytp-title-text,
+[data-ytpm-history-fence="true"] .ytp-title-link,
+[data-ytpm-history-fence="true"] .ytp-title-channel,
+[data-ytpm-history-fence="true"] .ytp-chrome-bottom,
+[data-ytpm-history-fence="true"] .ytp-gradient-top,
+[data-ytpm-history-fence="true"] .ytp-gradient-bottom,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-player-overlay,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-text,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-skip-button,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-skip-button-modern,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-skip-button-container,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-module,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-overlay-container,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-preview-container,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-preview-text,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-message-container,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-message,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-persistent-banner,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-image-overlay,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-action-interstitial,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-end-screens-paginated,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-paid-content-overlay,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-ad-badge,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-chrome-top,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-title,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-title-text,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-title-link,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-title-channel,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-chrome-bottom,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-gradient-top,
+[data-ytpm-preview-owned="true"][data-ytpm-presentation-closed="true"] .ytp-gradient-bottom {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.ytpm-overlay__ad-shield {
+  position: absolute !important;
+  inset: 0 !important;
+  z-index: 4 !important;
+  display: none !important;
+  align-items: center !important;
+  justify-content: center !important;
+  background: #000000 !important;
+  color: rgba(255, 255, 255, .82) !important;
+  font: 500 14px/1.3 Arial, sans-serif !important;
+  pointer-events: none !important;
+}
+
+.ytpm-overlay[data-ytpm-preview-owned="true"][data-ytpm-ad-suppressed="true"] .ytpm-overlay__ad-shield {
+  display: flex !important;
+}
+
 .ytpm-overlay__captions {
   position: absolute !important;
   right: 8% !important;
